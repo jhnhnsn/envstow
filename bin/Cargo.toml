@@ -2,7 +2,7 @@
 name = "envseal"
 version = "0.1.0"
 edition = "2021"
-description = "Decrypt SOPS+age secrets and hand them to a child process, in-memory only."
+description = "A local, file-based GitHub Secrets: an age-encrypted key-value store surfaced by name."
 license = "MIT"
 
 [[bin]]
@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 zeroize = "1"
+age = "0.11"
 
 [profile.release]
 strip = true

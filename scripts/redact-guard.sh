@@ -33,11 +33,20 @@ print("\n".join(parts))
 
 leaked=0
 # Walk the environment; flag any secret-shaped var whose VALUE appears in output.
+# We check both the raw value and its base64 encoding, since the most common
+# accidental-encoding path (`... | base64`, JSON blobs, etc.) would otherwise
+# slip a secret past a plain substring match. This is best-effort, not complete:
+# other encodings (hex, url-encoding, gzip) can still evade it — see the README threat model.
 while IFS='=' read -r name value; do
   case "$name" in
     *_KEY|*_TOKEN|*_SECRET|*_PASSWORD|*_PASSWD|API_*|*_API_KEY|*_PRIVATE_KEY)
       # Skip trivially short / empty values to avoid false positives.
-      if [ "${#value}" -ge 8 ] && printf '%s' "$output" | grep -qF -- "$value"; then
+      [ "${#value}" -ge 8 ] || continue
+      if printf '%s' "$output" | grep -qF -- "$value"; then
+        leaked=1
+      fi
+      b64="$(printf '%s' "$value" | base64 | tr -d '\n')"
+      if [ "${#b64}" -ge 8 ] && printf '%s' "$output" | grep -qF -- "$b64"; then
         leaked=1
       fi
       ;;

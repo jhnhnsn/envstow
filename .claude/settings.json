@@ -6,12 +6,11 @@
       "Bash(printenv)",
       "Bash(printenv:*)",
       "Bash(echo $*)",
+      "Bash(printf $*)",
       "Bash(set)",
       "Bash(export -p)",
-      "Bash(cat *keys.txt*)",
-      "Bash(cat *.dec.env*)",
-      "Bash(sops -d:*)",
-      "Bash(sops --decrypt:*)"
+      "Bash(cat *identity.txt*)",
+      "Bash(cat *.dec.env*)"
     ]
   },
   "hooks": {

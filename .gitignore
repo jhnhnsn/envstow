@@ -1,5 +1,5 @@
 # Never commit plaintext secrets or private keys.
-# The ONLY secrets file that belongs in git is secrets/*.enc.env (encrypted).
+# The ONLY secrets file that belongs in git is secrets/secrets.enc (age-encrypted).
 
 # Decrypted / plaintext env files
 *.dec.env
@@ -8,16 +8,18 @@
 .env.*
 !.env.example
 
-# age / private keys
+# age private keys / identities (envseal keeps yours in ~/.config/envseal/identity.txt,
+# but guard against a stray copy landing in the repo).
+identity.txt
 keys.txt
 *.age
 *.age.key
 *.agekey
 
-# direnv local state
-.direnv/
+# envseal edit temp file (should be shredded, but never commit it)
+.envseal-edit.tmp
 
-# Rust build output (the envseal launcher crate lives in bin/)
+# Rust build output (the envseal binary crate lives in bin/)
 bin/target/
 
 # OS / editor cruft
