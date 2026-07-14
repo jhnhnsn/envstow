@@ -91,12 +91,33 @@ fn load_secrets() -> Result<Vec<(String, String)>, String> {
     Ok(vars)
 }
 
+/// Environment markers set by AI coding agents that capture command output into their context.
+/// If any is present, `get` masks its value so plaintext can't land in the agent's transcript.
+/// This is a best-effort allowlist across known tools plus a generic opt-in — an agent that
+/// sets none of these is still expected to use `unlock -- <cmd>` (secrets by name), which never
+/// exposes a value regardless of detection.
+const AGENT_ENV_MARKERS: &[&str] = &[
+    // Claude Code
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    // Cursor
+    "CURSOR_TRACE_ID",
+    "CURSOR_AGENT",
+    // Aider
+    "AIDER_MODEL",
+    "AIDER_CHAT",
+    // Windsurf
+    "WINDSURF",
+    "WINDSURF_AGENT",
+    // Generic / cross-tool conventions + explicit opt-in
+    "AI_AGENT",
+    "AGENT",
+    "ENVSEAL_AGENT",
+];
+
 /// Are we very likely running under an agent that captures our stdout into its context?
-/// Claude Code sets these; other harnesses can opt in via `ENVSEAL_AGENT=1`.
 fn under_agent() -> bool {
-    env::var_os("CLAUDECODE").is_some()
-        || env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some()
-        || env::var_os("ENVSEAL_AGENT").is_some()
+    AGENT_ENV_MARKERS.iter().any(|m| env::var_os(m).is_some())
 }
 
 fn mask(value: &str) -> String {
@@ -997,20 +1018,28 @@ mod tests {
     }
 
     #[test]
-    fn under_agent_detects_claude_and_optin() {
-        // Save/restore the vars we touch.
-        let save = |k: &str| (k.to_string(), env::var_os(k));
-        let saved = [
-            save("CLAUDECODE"),
-            save("CLAUDE_CODE_ENTRYPOINT"),
-            save("ENVSEAL_AGENT"),
-        ];
+    fn under_agent_detects_every_known_marker() {
+        // Save every marker we might touch, clear them all, restore at the end. env::set_var is
+        // process-global, so we snapshot the full set to avoid disturbing other tests.
+        let saved: Vec<(String, Option<std::ffi::OsString>)> = AGENT_ENV_MARKERS
+            .iter()
+            .map(|m| (m.to_string(), env::var_os(m)))
+            .collect();
         for (k, _) in &saved {
             env::remove_var(k);
         }
-        assert!(!under_agent());
-        env::set_var("ENVSEAL_AGENT", "1");
-        assert!(under_agent());
+
+        // With all markers cleared, not under an agent.
+        assert!(!under_agent(), "no markers → not under agent");
+
+        // Each marker independently triggers detection (Claude, Cursor, Aider, Windsurf, opt-in).
+        for marker in AGENT_ENV_MARKERS {
+            env::set_var(marker, "1");
+            assert!(under_agent(), "{marker} should be detected as an agent");
+            env::remove_var(marker);
+        }
+
+        // Restore original environment.
         for (k, v) in saved {
             match v {
                 Some(v) => env::set_var(&k, v),

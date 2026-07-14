@@ -15,6 +15,30 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const BIN: &str = env!("CARGO_BIN_EXE_envseal");
 
+/// Every agent-detection marker envseal knows about. Tests must clear ALL of them to simulate a
+/// clean non-agent shell — the test process itself may run under an agent that sets some of them
+/// (e.g. AI_AGENT), which would otherwise make "not under agent" cases mask unexpectedly.
+const AGENT_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CURSOR_TRACE_ID",
+    "CURSOR_AGENT",
+    "AIDER_MODEL",
+    "AIDER_CHAT",
+    "WINDSURF",
+    "WINDSURF_AGENT",
+    "AI_AGENT",
+    "AGENT",
+    "ENVSEAL_AGENT",
+];
+
+/// Strip all agent markers from a Command so the child sees a non-agent environment.
+fn clear_agent_markers(cmd: &mut Command) {
+    for m in AGENT_MARKERS {
+        cmd.env_remove(m);
+    }
+}
+
 /// A disposable repo dir + identity path. Removed on drop.
 struct Repo {
     dir: PathBuf,
@@ -41,19 +65,16 @@ impl Repo {
     fn run(&self, args: &[&str], stdin_data: &str) -> Output {
         use std::io::Write;
         use std::process::Stdio;
-        let mut child = Command::new(BIN)
-            .args(args)
+        let mut cmd = Command::new(BIN);
+        cmd.args(args)
             .current_dir(&self.dir)
             .env("ENVSEAL_IDENTITY", &self.identity)
-            // Ensure a deterministic non-agent, non-tty context unless a test overrides it.
-            .env_remove("CLAUDECODE")
-            .env_remove("CLAUDE_CODE_ENTRYPOINT")
-            .env_remove("ENVSEAL_AGENT")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn envseal");
+            .stderr(Stdio::piped());
+        // Ensure a deterministic non-agent, non-tty context unless a test overrides it.
+        clear_agent_markers(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn envseal");
         child
             .stdin
             .take()
@@ -72,19 +93,16 @@ impl Repo {
     fn run_env(&self, args: &[&str], stdin_data: &str, key: &str, val: &str) -> Output {
         use std::io::Write;
         use std::process::Stdio;
-        let mut child = Command::new(BIN)
-            .args(args)
+        let mut cmd = Command::new(BIN);
+        cmd.args(args)
             .current_dir(&self.dir)
             .env("ENVSEAL_IDENTITY", &self.identity)
-            .env_remove("CLAUDECODE")
-            .env_remove("CLAUDE_CODE_ENTRYPOINT")
-            .env_remove("ENVSEAL_AGENT")
-            .env(key, val)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn envseal");
+            .stderr(Stdio::piped());
+        clear_agent_markers(&mut cmd);
+        cmd.env(key, val); // test-specified var wins (set AFTER clearing)
+        let mut child = cmd.spawn().expect("spawn envseal");
         child
             .stdin
             .take()
@@ -365,7 +383,8 @@ fn add_and_remove_recipient_controls_access() {
     assert_eq!(add.code, 0, "add-recipient failed: {}", add.stderr);
 
     // The collaborator can now decrypt the OWNER's store using THEIR identity.
-    let as_collab = Command::new(BIN)
+    let mut as_collab_cmd = Command::new(BIN);
+    as_collab_cmd
         .args([
             "unlock",
             "--",
@@ -374,10 +393,9 @@ fn add_and_remove_recipient_controls_access() {
             "test \"$SECRET\" = sharedvalue && echo OK",
         ])
         .current_dir(&owner.dir) // owner's store + recipients
-        .env("ENVSEAL_IDENTITY", &collab.identity) // but collaborator's key
-        .env_remove("CLAUDECODE")
-        .output()
-        .unwrap();
+        .env("ENVSEAL_IDENTITY", &collab.identity); // but collaborator's key
+    clear_agent_markers(&mut as_collab_cmd);
+    let as_collab = as_collab_cmd.output().unwrap();
     assert!(
         String::from_utf8_lossy(&as_collab.stdout).contains("OK"),
         "collaborator should decrypt after add: {}",
@@ -393,13 +411,13 @@ fn add_and_remove_recipient_controls_access() {
     );
 
     // Now the collaborator can NO LONGER decrypt.
-    let after = Command::new(BIN)
+    let mut after_cmd = Command::new(BIN);
+    after_cmd
         .args(["unlock", "--", "true"])
         .current_dir(&owner.dir)
-        .env("ENVSEAL_IDENTITY", &collab.identity)
-        .env_remove("CLAUDECODE")
-        .output()
-        .unwrap();
+        .env("ENVSEAL_IDENTITY", &collab.identity);
+    clear_agent_markers(&mut after_cmd);
+    let after = after_cmd.output().unwrap();
     assert_ne!(
         after.status.code(),
         Some(0),
