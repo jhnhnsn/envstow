@@ -163,6 +163,26 @@ fn init_creates_identity_recipients_and_store() {
 }
 
 #[test]
+fn pubkey_prints_the_public_key_matching_recipients() {
+    let repo = Repo::new("pubkey");
+    assert_eq!(repo.run(&["init"], "").code, 0);
+
+    let out = repo.run(&["pubkey"], "");
+    assert_eq!(out.code, 0, "pubkey failed: {}", out.stderr);
+    let printed = out.stdout.trim();
+    assert!(
+        printed.starts_with("age1"),
+        "should print an age public key, got {printed:?}"
+    );
+    // It must match the key `init` wrote into the recipients file.
+    assert_eq!(
+        printed,
+        repo.public_key(),
+        "pubkey must match the recipients entry"
+    );
+}
+
+#[test]
 fn set_list_and_unlock_roundtrip() {
     let repo = Repo::new("roundtrip");
     assert_eq!(repo.run(&["init"], "").code, 0);

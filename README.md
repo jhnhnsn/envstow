@@ -141,6 +141,7 @@ docker run -e OPENAI_API_KEY="$(envseal get OPENAI_API_KEY)" myimage
 # Teammate (Alice): clone the repo, then generate her key and print it.
 git clone …/my-project && cd my-project
 envseal init            # adds her to `recipients`; prints her public key: age1abc…
+envseal pubkey          # …or reprint it any time — safe to paste in Slack/email/a PR
 #   ⚠️ adding your key here does NOT let you decrypt yet — a current member must re-key.
 
 # You (existing member): add Alice's key and re-encrypt the store to include her.
@@ -150,6 +151,15 @@ git add recipients secrets/secrets.enc && git commit -m "Add Alice" && git push
 # Alice pulls — now she can decrypt with her own key:
 git pull && envseal list
 ```
+
+> **What's actually shared:** only the **public** key (`age1…`), which is not a secret —
+> knowing it lets you *encrypt to* someone, never decrypt. So the channel doesn't need to be
+> confidential (Slack, email, a PR are all fine), but it should be *authentic*: make sure the
+> `age1…` really is your teammate's. The safest path is to have them add their own key line in
+> a **pull request** — the key is in the diff, tied to their identity, and recorded in git
+> history. The **private** key (`AGE-SECRET-KEY-…` in `~/.config/envseal/identity.txt`) is
+> never shared, pasted, or committed; if one ever leaks, rotate that person's key *and* every
+> secret it could decrypt.
 
 ### 7. Offboard a teammate (and actually revoke)
 
@@ -190,6 +200,7 @@ envseal reads the identity from `$ENVSEAL_IDENTITY` if set, so give CI a **dedic
 | `envseal edit` | Decrypt all secrets into `$EDITOR`, re-encrypt on save (temp file shredded). |
 | `envseal get <NAME> [--show]` | Resolve one secret by name. **Masked under an agent** unless `--show`. |
 | `envseal list` | List secret **names** (never values). |
+| `envseal pubkey` | Print your age **public** key, to share so a member can add you. |
 | `envseal unlock [-- <cmd>]` | Run a command (or subshell) with every secret set as an env var. |
 | `envseal add-recipient <age1…> [label]` | Add a collaborator; re-encrypt. |
 | `envseal remove-recipient <key\|label>` | Remove a collaborator; re-encrypt (then **rotate**). |

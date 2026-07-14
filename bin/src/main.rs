@@ -6,6 +6,7 @@
 //!   envseal get <NAME> [--show]     Resolve one secret by name (masked under an agent).
 //!   envseal unlock [-- <cmd>...]    Spawn a subshell / run a command with the whole env set.
 //!   envseal init                    Generate an identity, add self as recipient, create store.
+//!   envseal pubkey                  Print your age public key (share it to be added).
 //!   envseal add-recipient <age1..>  Add a recipient and re-encrypt the store.
 //!   envseal remove-recipient <k|nm> Remove a recipient and re-encrypt (then rotate!).
 //!   envseal reencrypt               Re-encrypt the store to the current recipients file.
@@ -46,6 +47,7 @@ fn main() {
         Some("set") => cmd_set(&args[1..]),
         Some("edit") => cmd_edit(),
         Some("list") => cmd_list(),
+        Some("pubkey") => cmd_pubkey(),
         Some("unlock") => cmd_unlock(&args[1..]),
         Some("init") => cmd_init(&args[1..]),
         Some("add-recipient") => cmd_add_recipient(&args[1..]),
@@ -247,6 +249,29 @@ fn cmd_list() -> i32 {
         v.zeroize();
     }
     0
+}
+
+/// `envseal pubkey` — print YOUR age public key (derived from your identity), so you can share
+/// it with a collaborator who will `add-recipient` it. The public key is not a secret; it is
+/// always safe to print, even under an agent.
+fn cmd_pubkey() -> i32 {
+    let secret = match layout::read_identity_secret() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("envseal: {e}");
+            return 1;
+        }
+    };
+    match crypto::public_from_secret(&secret) {
+        Ok(public) => {
+            println!("{public}");
+            0
+        }
+        Err(e) => {
+            eprintln!("envseal: identity is unreadable: {e}");
+            1
+        }
+    }
 }
 
 /// Serialize `vars` to dotenv, encrypt to the current recipients, and write the store.
@@ -850,6 +875,7 @@ fn print_help() {
          \x20 envseal set <NAME>               Read a value from stdin and store it.\n\
          \x20 envseal edit                     Edit all secrets in $EDITOR (decrypt/re-encrypt).\n\
          \x20 envseal list                     List secret NAMES (never values).\n\
+         \x20 envseal pubkey                   Print your age PUBLIC key (share it to be added).\n\
          \x20 envseal unlock [-- <cmd>...]     Subshell / run a command with the whole env set.\n\
          \x20 envseal init                     Create identity + recipients + empty store.\n\
          \x20 envseal add-recipient <age1..>   Add a collaborator and re-encrypt.\n\
