@@ -156,6 +156,47 @@ fn resolve_profile(args: &[String]) -> Result<(String, Vec<String>), AppError> {
     Ok((profile, rest))
 }
 
+/// A parsed `[flags] [<NAME>]` command line, shared by `get`/`set`/`delete` — the three commands
+/// with the same shape.
+struct ParsedArgs<'a> {
+    /// Canonical names of the boolean flags that were present.
+    flags: Vec<&'static str>,
+    /// The single positional argument (a secret NAME), if given.
+    positional: Option<&'a str>,
+}
+
+impl ParsedArgs<'_> {
+    fn has(&self, flag: &'static str) -> bool {
+        self.flags.contains(&flag)
+    }
+}
+
+/// Parse `[flags] [<NAME>]`. `known` maps each accepted flag spelling to a canonical name (so
+/// aliases like `-c`/`--clipboard` collapse to one). An unknown `-flag`, or more than one
+/// positional, is a usage error naming the offender.
+fn parse_simple<'a>(
+    args: &'a [String],
+    known: &[(&str, &'static str)],
+) -> Result<ParsedArgs<'a>, AppError> {
+    let mut flags = Vec::new();
+    let mut positional = None;
+    for a in args {
+        let s = a.as_str();
+        if let Some((_, canon)) = known.iter().find(|(spelling, _)| *spelling == s) {
+            if !flags.contains(canon) {
+                flags.push(*canon);
+            }
+        } else if s.starts_with('-') {
+            return Err(AppError::usage(format!("unknown flag '{s}'")));
+        } else if positional.is_some() {
+            return Err(AppError::usage("expected a single NAME"));
+        } else {
+            positional = Some(s);
+        }
+    }
+    Ok(ParsedArgs { flags, positional })
+}
+
 /// Decrypt the located store for `profile` with the user's identity into a [`Secrets`] (whose
 /// values are zeroized on drop).
 fn load_secrets(profile: &str) -> Result<Secrets, AppError> {
@@ -300,21 +341,9 @@ fn masked_preview(value: &str) -> String {
 ///   * stdout is a pipe / command substitution (and NOT under an agent) → print the value.
 fn cmd_get(args: &[String]) -> Cmd {
     let (profile, args) = resolve_profile(args)?;
-    let mut show = false;
-    let mut name: Option<&str> = None;
-    for a in &args {
-        match a.as_str() {
-            "--show" => show = true,
-            s if s.starts_with('-') => return Err(AppError::usage(format!("unknown flag '{s}'"))),
-            s => {
-                if name.is_some() {
-                    return Err(AppError::usage("expected a single NAME"));
-                }
-                name = Some(s);
-            }
-        }
-    }
-    let Some(name) = name else {
+    let parsed = parse_simple(&args, &[("--show", "show")])?;
+    let show = parsed.has("show");
+    let Some(name) = parsed.positional else {
         return Err(AppError::usage(
             "usage: envstow get <NAME> [--profile P] [--show]",
         ));
@@ -357,21 +386,9 @@ fn cmd_get(args: &[String]) -> Cmd {
 /// `--clipboard` reads the OS clipboard instead of stdin (same guarantee: never in argv).
 fn cmd_set(args: &[String]) -> Cmd {
     let (profile, args) = resolve_profile(args)?;
-    let mut from_clipboard = false;
-    let mut name: Option<&str> = None;
-    for a in &args {
-        match a.as_str() {
-            "--clipboard" | "-c" => from_clipboard = true,
-            s if s.starts_with('-') => return Err(AppError::usage(format!("unknown flag '{s}'"))),
-            s => {
-                if name.is_some() {
-                    return Err(AppError::usage("expected a single NAME"));
-                }
-                name = Some(s);
-            }
-        }
-    }
-    let Some(name) = name else {
+    let parsed = parse_simple(&args, &[("--clipboard", "clipboard"), ("-c", "clipboard")])?;
+    let from_clipboard = parsed.has("clipboard");
+    let Some(name) = parsed.positional else {
         return Err(AppError::usage(
             "usage: envstow set <NAME> [--profile P] [--clipboard]   (then type the value + \
              Enter, or pipe it: `printf '%s' value | envstow set <NAME>`)",
@@ -521,21 +538,9 @@ fn read_clipboard() -> Result<String, String> {
 /// revoked one — hence the rotate reminder, mirroring `remove-recipient`.
 fn cmd_delete(args: &[String]) -> Cmd {
     let (profile, args) = resolve_profile(args)?;
-    let mut force = false;
-    let mut name: Option<&str> = None;
-    for a in &args {
-        match a.as_str() {
-            "--force" | "-f" => force = true,
-            s if s.starts_with('-') => return Err(AppError::usage(format!("unknown flag '{s}'"))),
-            s => {
-                if name.is_some() {
-                    return Err(AppError::usage("expected a single NAME"));
-                }
-                name = Some(s);
-            }
-        }
-    }
-    let Some(name) = name else {
+    let parsed = parse_simple(&args, &[("--force", "force"), ("-f", "force")])?;
+    let force = parsed.has("force");
+    let Some(name) = parsed.positional else {
         return Err(AppError::usage(
             "usage: envstow delete <NAME> [--profile P] [--force]",
         ));
