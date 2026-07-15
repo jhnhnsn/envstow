@@ -7,6 +7,7 @@
 //!   envstow set <NAME> [--clipboard] Store a value from stdin, or the OS clipboard.
 //!   envstow delete <NAME>           Remove one secret and re-encrypt (then rotate!).
 //!   envstow unlock [-- <cmd>...]    Spawn a subshell / run a command with the whole env set.
+//!   envstow refresh                 Emit `unset` lines for secrets that left the store (eval it).
 //!   envstow init                    Generate an identity, add self as recipient, create store.
 //!   envstow pubkey                  Print your age public key (share it to be added).
 //!   envstow add-recipient <age1..>  Add a recipient and re-encrypt the store.
@@ -71,6 +72,7 @@ fn main() {
         Some("list") => cmd_list(&args[1..]),
         Some("pubkey") => cmd_pubkey(),
         Some("unlock") => cmd_unlock(&args[1..]),
+        Some("refresh") => cmd_refresh(&args[1..]),
         Some("init") => cmd_init(&args[1..]),
         Some("add-recipient") => cmd_add_recipient(&args[1..]),
         Some("remove-recipient") => cmd_remove_recipient(&args[1..]),
@@ -872,6 +874,157 @@ fn warn_on_shadowed(vars: &[(String, String)]) {
     );
 }
 
+/// Env var listing the NAMES envstow set in this environment, comma-separated. Names only —
+/// never values. Lets `refresh` unset exactly what envstow owns and nothing else.
+const LOADED_MARKER: &str = "ENVSTOW_LOADED";
+
+/// Is `name` a plain shell identifier — `[A-Za-z_][A-Za-z0-9_]*`? Anything else is unsafe to
+/// interpolate into shell code that will be `eval`ed.
+fn is_shell_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Build the `ENVSTOW_LOADED` value for a child: the names we're about to set, unioned with any
+/// an outer unlock already recorded (nested unlocks stack, so the outer names are still live).
+fn loaded_marker(vars: &[(String, String)]) -> String {
+    let mut names: Vec<String> = env::var(LOADED_MARKER)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for (k, _) in vars {
+        if !names.iter().any(|n| n == k) {
+            names.push(k.clone());
+        }
+    }
+    names.join(",")
+}
+
+/// The names envstow recorded setting in this environment, per `ENVSTOW_LOADED`.
+fn loaded_names() -> Vec<String> {
+    env::var(LOADED_MARKER)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `envstow refresh` — emit shell code to unset secrets this environment has but the store no
+/// longer does. Meant to be evaluated by your shell: `eval "$(envstow refresh)"`.
+///
+/// Why this exists: a child process cannot modify its parent's environment, so nothing envstow
+/// runs can clear a stale variable from your shell. `eval` sidesteps that by having YOUR shell
+/// execute what we print. The classic form of this trick (ssh-agent, direnv) prints `export
+/// NAME=value` — which for envstow would mean dumping every secret in plaintext to stdout, the
+/// one thing this tool exists to prevent. So we print ONLY `unset` lines.
+///
+/// That makes this deliberately one-directional:
+///   * a DELETED secret is unset here — nothing about a value is revealed by unsetting its name;
+///   * a CHANGED or ADDED secret is NOT updated — that would require printing the new value.
+///
+/// For those, exit and unlock again. `refresh` reports them so you know.
+///
+/// Only names in `ENVSTOW_LOADED` are considered, so a `DATABASE_URL` from your shell rc is never
+/// touched — envstow only unsets what it set.
+fn cmd_refresh(args: &[String]) -> i32 {
+    let (profile, args) = match resolve_profile(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("envstow refresh: {e}");
+            return 2;
+        }
+    };
+    if let Some(a) = args.first() {
+        eprintln!("envstow refresh: unexpected argument '{a}'");
+        return 2;
+    }
+    if env::var_os("ENVSTOW_UNLOCKED").is_none() {
+        eprintln!(
+            "envstow refresh: not inside an `envstow unlock` shell — nothing to refresh.\n\
+             \x20  (refresh clears secrets this shell still holds after they left the store.)"
+        );
+        return 1;
+    }
+
+    let mut vars = match load_secrets(&profile) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("envstow: {e}");
+            return 1;
+        }
+    };
+
+    // Stale = envstow set it here, and the store no longer has it. Note we compare against the
+    // names WE recorded, not the whole environment, so we never unset someone else's var.
+    let in_store: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+    let stale: Vec<String> = loaded_names()
+        .into_iter()
+        .filter(|n| !in_store.contains(&n.as_str()) && env::var_os(n).is_some())
+        .collect();
+
+    // Changed = still in the store, but this shell holds a different value. We can't fix these
+    // without printing the new value, so we only report the count.
+    let changed = vars
+        .iter()
+        .filter(|(k, v)| {
+            env::var_os(k).is_some_and(|existing| existing.to_string_lossy() != v.as_str())
+        })
+        .count();
+
+    for (_, v) in vars.iter_mut() {
+        v.zeroize();
+    }
+
+    // stdout is the eval payload — shell code ONLY, so a stray word can't be executed.
+    //
+    // Every name here is interpolated into code the user's shell will EVALUATE, so it must be a
+    // plain identifier. A store is trusted input, but "trusted" is not a property to bet a shell
+    // injection on: a name like `FOO; rm -rf ~` would otherwise run. Anything that isn't
+    // [A-Za-z_][A-Za-z0-9_]* is skipped and reported, never emitted.
+    let (safe, unsafe_): (Vec<&String>, Vec<&String>) =
+        stale.iter().partition(|n| is_shell_identifier(n));
+    let mut out = io::stdout().lock();
+    for name in &safe {
+        let _ = writeln!(out, "unset {name}");
+    }
+    let _ = out.flush();
+    if !unsafe_.is_empty() {
+        eprintln!(
+            "envstow: refusing to emit {} name(s) that aren't plain identifiers (would be unsafe \
+             to eval). Run `exit` then `envstow unlock` instead.",
+            unsafe_.len()
+        );
+    }
+
+    // Everything human-facing goes to stderr, where `eval "$(...)"` won't swallow or run it.
+    if safe.is_empty() {
+        eprintln!("envstow: nothing to unset — no secret in this shell has left the store.");
+    } else {
+        eprintln!(
+            "🔄 envstow: unset {} secret(s) no longer in the store: {}",
+            safe.len(),
+            safe.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if changed > 0 {
+        eprintln!(
+            "⚠️  envstow: {changed} secret(s) in this shell have a different value in the store. \
+             refresh can't update them without printing values — run `exit` then `envstow unlock`."
+        );
+    }
+    0
+}
+
 /// Spawn either the given command or an interactive subshell, with `vars` in its env.
 /// Zeroizes the values after the child has been launched. Returns the child's exit code.
 fn spawn_with_env(cmd: &[String], mut vars: Vec<(String, String)>) -> i32 {
@@ -893,6 +1046,11 @@ fn spawn_with_env(cmd: &[String], mut vars: Vec<(String, String)>) -> i32 {
         command.env(k, v);
     }
     command.env("ENVSTOW_UNLOCKED", "1");
+    // Record WHICH names we set, so `refresh` can tell an envstow secret from a same-named var
+    // that came from your shell rc or CI — and only ever unset the ones we own. Names only; a
+    // name is not a secret (`list` prints them). Nested unlocks union with the outer set, so an
+    // inner refresh still knows about the outer store's names.
+    command.env("ENVSTOW_LOADED", loaded_marker(&vars));
     command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -1473,6 +1631,7 @@ fn print_help() {
          \x20 envstow list                     List secret NAMES (never values).\n\
          \x20 envstow pubkey                   Print your age PUBLIC key (share it to be added).\n\
          \x20 envstow unlock [-- <cmd>...]     Subshell / run a command with the whole env set.\n\
+         \x20 envstow refresh                  Unset secrets that left the store: eval \"$(envstow refresh)\".\n\
          \x20 envstow init [--no-skill]        Create identity + recipients + store; add agent skill.\n\
          \x20 envstow add-recipient <age1..>   Add a collaborator and re-encrypt.\n\
          \x20 envstow remove-recipient <k|nm>  Remove a collaborator and re-encrypt (then rotate).\n\
@@ -1499,6 +1658,65 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_identifiers_gate_what_can_be_evaled() {
+        // These are interpolated into code the user's shell will eval. Anything that could break
+        // out of `unset <name>` must be rejected — a store is trusted input, but not THAT trusted.
+        for ok in ["FOO", "_x", "A1", "DATABASE_URL", "a_b_c9"] {
+            assert!(is_shell_identifier(ok), "{ok} should be a valid identifier");
+        }
+        for bad in [
+            "",
+            "1FOO",          // leading digit
+            "FOO; rm -rf ~", // command injection
+            "FOO BAR",
+            "FOO$(id)",
+            "FOO`id`",
+            "FOO&&id",
+            "FOO\nid",
+            "FOO'",
+            "FÖO", // non-ASCII
+        ] {
+            assert!(
+                !is_shell_identifier(bad),
+                "{bad:?} must NOT be treated as a safe identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_marker_unions_with_an_outer_unlock() {
+        let prev = env::var_os(LOADED_MARKER);
+        // Nested unlock: the outer store's names are still live in the environment, so the inner
+        // marker must keep them — otherwise a refresh inside the inner shell would forget them.
+        env::set_var(LOADED_MARKER, "OUTER_A,SHARED");
+        let inner = vec![
+            ("SHARED".to_string(), "v".to_string()),
+            ("INNER_B".to_string(), "v".to_string()),
+        ];
+        let marker = loaded_marker(&inner);
+        let names: Vec<&str> = marker.split(',').collect();
+        assert!(names.contains(&"OUTER_A"), "keeps outer names: {marker}");
+        assert!(names.contains(&"INNER_B"), "adds inner names: {marker}");
+        assert_eq!(
+            names.iter().filter(|n| **n == "SHARED").count(),
+            1,
+            "no duplicate for a name in both: {marker}"
+        );
+
+        env::remove_var(LOADED_MARKER);
+        assert_eq!(
+            loaded_marker(&inner),
+            "SHARED,INNER_B",
+            "with no outer marker, just our own names"
+        );
+
+        match prev {
+            Some(v) => env::set_var(LOADED_MARKER, v),
+            None => env::remove_var(LOADED_MARKER),
+        }
+    }
 
     #[test]
     fn mask_hides_value_and_length() {

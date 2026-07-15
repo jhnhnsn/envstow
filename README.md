@@ -237,6 +237,7 @@ env var > `default`. Using a profile that doesn't exist errors and tells you to
 | `envstow list` | List secret **names** (never values). |
 | `envstow pubkey` | Print your age **public** key, to share so a member can add you. |
 | `envstow unlock [-- <cmd>]` | Run a command (or subshell) with every secret set as an env var. |
+| `eval "$(envstow refresh)"` | Unset secrets this shell still holds that have left the store. Only emits `unset` — see [Stale secrets](#stale-secrets-in-an-unlocked-shell). |
 | `envstow add-recipient <age1…> [label]` | Add a collaborator; re-encrypt. |
 | `envstow remove-recipient <key\|label>` | Remove a collaborator; re-encrypt (then **rotate**). |
 | `envstow reencrypt` | Re-encrypt the store to the current `recipients` (after hand-editing it). |
@@ -313,6 +314,47 @@ casual/accidental AI exposure of values.
 process exfiltrating a live var; plaintext already in git history; retroactive access removal;
 a value someone deliberately reveals with `--show` or re-encodes to evade the redact-guard.
 For those: rotate, and treat this as strong hygiene, not a vault.
+
+---
+
+## Stale secrets in an unlocked shell
+
+Your unlocked shell got its environment **at spawn time, as a copy**. Delete or change a secret
+afterwards and the shell keeps the old value — no process can reach into a running one and change
+its environment. That's an OS boundary, not an envstow limitation.
+
+For a **deleted** secret, `refresh` clears it in place:
+
+```bash
+eval "$(envstow refresh)"
+#   → 🔄 envstow: unset 1 secret(s) no longer in the store: OLD_TOKEN
+```
+
+The `eval` is what makes it work: envstow prints shell code and **your shell** runs it, which is
+the only way to alter the shell you're standing in. (Same trick as `ssh-agent` and `direnv`.)
+
+It is deliberately **one-directional — it only ever emits `unset`:**
+
+| Change | `refresh` | Why |
+|---|---|---|
+| Secret **deleted** | ✅ unset in place | Unsetting a name reveals nothing |
+| Secret **changed** or **added** | ❌ reported, not applied | Would mean printing the value to stdout |
+
+Updating a value would require `export NAME=<value>` on stdout — dumping plaintext, the one thing
+envstow exists to prevent (and catastrophic under an agent, which captures stdout). So for changed
+or added secrets, `refresh` tells you and you re-unlock:
+
+```bash
+exit && envstow unlock
+```
+
+`refresh` only unsets names **envstow itself set** (tracked in `ENVSTOW_LOADED`), so a same-named
+variable from your shell rc is never touched. Note that neither `envstow unlock` again nor
+`exec envstow unlock` fixes a stale delete — both **inherit** the current environment, and
+inheriting can add or overwrite but never unset. `exit` is what actually drops it.
+
+It emits POSIX `unset` syntax (bash/zsh/sh/fish), so on **PowerShell** use `exit` +
+`envstow unlock` instead.
 
 ---
 

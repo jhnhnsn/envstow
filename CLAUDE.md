@@ -34,6 +34,8 @@ install or invoke.
 - `envstow delete <NAME>` — remove one secret and re-encrypt (`--force` to skip the prompt).
 - `envstow edit` — open all secrets in `$EDITOR` (decrypt → edit → re-encrypt).
 - `envstow list` — list secret **names** (never values).
+- `eval "$(envstow refresh)"` — inside an unlocked shell, unset secrets that have since left the
+  store. Only ever emits `unset` lines, never values, so it's safe to run under an agent.
 - `envstow add-recipient <age1...>` / `remove-recipient <key|label>` — manage collaborators.
 
 The human generates their key and creates the store with `envstow init`. You do not need to

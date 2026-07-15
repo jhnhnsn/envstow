@@ -1,6 +1,6 @@
 [package]
 name = "envstow"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 description = "An age-encrypted key-value secret store, committed to your repo and surfaced by name."
 license = "MIT"

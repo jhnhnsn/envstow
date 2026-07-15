@@ -530,6 +530,135 @@ fn set_clipboard_errors_when_no_tool_is_available() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn refresh_unsets_a_deleted_secret_via_eval() {
+    let repo = Repo::new("refresh");
+    assert_eq!(repo.run(&["init"], "").code, 0);
+    assert_eq!(repo.run(&["set", "DOOMED"], "doomedval").code, 0);
+    assert_eq!(repo.run(&["set", "KEEPER"], "keeperval").code, 0);
+
+    // The whole point: inside an unlocked shell, delete a secret, then `eval $(envstow refresh)`
+    // must clear it from THIS shell — the thing exit+unlock otherwise requires.
+    let bin = BIN;
+    let script = format!(
+        r#"
+        test -n "$DOOMED" || {{ echo "SETUP-FAIL: DOOMED not set"; exit 1; }}
+        {bin} delete DOOMED --force >/dev/null 2>&1
+        # Still set: the store changed, this process's env did not.
+        test -n "$DOOMED" || {{ echo "FAIL: expected DOOMED still set pre-refresh"; exit 1; }}
+        eval "$({bin} refresh 2>/dev/null)"
+        # Now gone, and the surviving secret is untouched.
+        test -z "$DOOMED" || {{ echo "FAIL: DOOMED survived refresh"; exit 1; }}
+        test -n "$KEEPER" || {{ echo "FAIL: refresh clobbered KEEPER"; exit 1; }}
+        echo REFRESH-OK
+        "#
+    );
+    let out = repo.run(&["unlock", "--", "sh", "-c", &script], "");
+    assert!(
+        out.stdout.contains("REFRESH-OK"),
+        "refresh should unset the deleted secret in-place: {} {}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn refresh_never_emits_a_value() {
+    // stdout is eval'd by the user's shell — it must contain ONLY `unset` lines, never a value,
+    // or `eval` would both leak and execute it.
+    let repo = Repo::new("refreshsafe");
+    assert_eq!(repo.run(&["init"], "").code, 0);
+    assert_eq!(repo.run(&["set", "GONE"], "goneval").code, 0);
+    assert_eq!(repo.run(&["set", "STAYS"], "staysval").code, 0);
+
+    let bin = BIN;
+    // Delete one and CHANGE another, then capture exactly what refresh writes to stdout.
+    let script = format!(
+        r#"
+        {bin} delete GONE --force >/dev/null 2>&1
+        printf 'newvalue' | {bin} set STAYS >/dev/null 2>&1
+        {bin} refresh 2>/dev/null
+        "#
+    );
+    let out = repo.run(&["unlock", "--", "sh", "-c", &script], "");
+    assert!(
+        !out.stdout.contains("goneval")
+            && !out.stdout.contains("staysval")
+            && !out.stdout.contains("newvalue"),
+        "stdout must never carry a value: {:?}",
+        out.stdout
+    );
+    for line in out.stdout.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            line.starts_with("unset "),
+            "every eval line must be an unset, got {line:?}"
+        );
+    }
+    assert!(
+        out.stdout.contains("unset GONE"),
+        "should unset the deleted one: {:?}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("unset STAYS"),
+        "must not unset a secret that's still in the store: {:?}",
+        out.stdout
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn refresh_only_touches_names_envstow_set() {
+    // A same-named var from your shell rc must never be unset — envstow only owns what it set.
+    let repo = Repo::new("refreshown");
+    assert_eq!(repo.run(&["init"], "").code, 0);
+    assert_eq!(repo.run(&["set", "MINE"], "mineval").code, 0);
+
+    let bin = BIN;
+    // NOT_MINE looks like a stale secret (set in the env, absent from the store) but envstow
+    // never set it, so it must not appear in the eval payload.
+    let script = format!(
+        r#"
+        export NOT_MINE=from-the-shell-rc
+        {bin} delete MINE --force >/dev/null 2>&1
+        {bin} refresh 2>/dev/null
+        "#
+    );
+    let out = repo.run(&["unlock", "--", "sh", "-c", &script], "");
+    assert!(
+        !out.stdout.contains("NOT_MINE"),
+        "must not unset a var envstow didn't set: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("unset MINE"),
+        "should still unset its own: {:?}",
+        out.stdout
+    );
+}
+
+#[test]
+fn refresh_outside_an_unlocked_shell_is_refused() {
+    let repo = Repo::new("refreshbare");
+    assert_eq!(repo.run(&["init"], "").code, 0);
+    assert_eq!(repo.run(&["set", "X"], "v").code, 0);
+
+    let out = repo.run(&["refresh"], "");
+    assert_ne!(out.code, 0, "should refuse outside an unlock");
+    assert!(
+        out.stderr.contains("not inside"),
+        "should explain why: {}",
+        out.stderr
+    );
+    assert!(
+        out.stdout.trim().is_empty(),
+        "must emit no eval payload: {:?}",
+        out.stdout
+    );
+}
+
 #[test]
 fn unlock_warns_when_it_shadows_a_different_value() {
     let repo = Repo::new("shadow");

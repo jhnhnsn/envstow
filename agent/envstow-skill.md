@@ -70,6 +70,21 @@ secret, then run it. The value goes clipboard → store without passing through 
 
 After changing secrets, remind the human to `git add .envstow && git commit`.
 
+## Stale secrets after a change
+
+An unlocked shell holds a **copy** of the environment from when it started. If a secret is deleted
+or changed after that, the shell (and anything you run in it) still has the old value — no process
+can modify a running process's environment.
+
+If a secret was **deleted** and is still set, clear it in place:
+
+```bash
+eval "$(envstow refresh)"     # emits only `unset` lines — no values, safe for you to run
+```
+
+If a secret was **changed**, `refresh` can't help (updating it would mean printing the value).
+Tell the human to `exit` the unlocked shell and re-run `envstow unlock`.
+
 ## Removing a secret
 
 ```bash

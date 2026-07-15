@@ -2,6 +2,31 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
+## 0.1.11
+
+### Added
+- **`eval "$(envstow refresh)"`** — clear secrets an unlocked shell still holds after they've left
+  the store. An unlocked shell owns a *copy* of the environment from spawn time, and no process
+  can modify a running process's environment, so a deleted secret otherwise stays live until you
+  `exit`. `refresh` sidesteps that the way `ssh-agent` and `direnv` do: envstow prints shell code
+  and **your shell** evaluates it.
+  ```
+  $ envstow delete OLD_TOKEN --force
+  $ eval "$(envstow refresh)"
+  🔄 envstow: unset 1 secret(s) no longer in the store: OLD_TOKEN
+  ```
+  **It only ever emits `unset`.** Updating a changed value would mean printing plaintext to
+  stdout — the one thing envstow exists to prevent, and catastrophic under an agent that captures
+  it. So deleted secrets are unset in place; changed or added ones are *reported* with a nudge to
+  `exit` and re-unlock. Only names envstow itself set are touched (tracked in the new
+  `ENVSTOW_LOADED` marker), so a same-named var from your shell rc is never unset, and names that
+  aren't plain shell identifiers are refused rather than interpolated into eval'd code. POSIX
+  shells only; on PowerShell, `exit` and unlock again.
+
+### Changed
+- `unlock` now also sets **`ENVSTOW_LOADED`** in the child: a comma-separated list of the secret
+  **names** it set (never values). Nested unlocks union with the outer list.
+
 ## 0.1.10
 
 ### Added
