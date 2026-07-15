@@ -2,6 +2,19 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
+## 0.1.16
+
+### Changed
+- **The agent skill now teaches the output-guard's semantics as instructions.** The mechanical
+  hook (`redact-guard.sh`) is opt-in and agent-only; the skill is what every `envstow init` ships.
+  It gains a "Subtle ways a value leaks" section covering the non-obvious cases instructions can
+  actually help with — a value riding out in verbose/debug output or a stack trace, encoding not
+  laundering a secret, redirect-then-read, reconstructing from parts — plus a nudge to prefer
+  scoped `unlock -- <cmd>` (secrets never enter the agent's own env) over a session-wide unlock.
+  This strengthens the *instruction* layer; it does not replace the mechanical guard, which is the
+  only layer that holds when an agent doesn't cooperate. Re-run `envstow init` to update the skill
+  in an existing repo.
+
 ## 0.1.15
 
 ### Security

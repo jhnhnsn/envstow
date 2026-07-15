@@ -20,6 +20,31 @@ a plain `.env` or another secrets tool.
 `$FLY_API_TOKEN`). If you need a secret in a command, use `envstow unlock -- <cmd>` (below) so
 the value only ever lives in the child process — never in your transcript.
 
+## Subtle ways a value leaks (guard against these yourself)
+
+The obvious leak is `echo $SECRET`. The dangerous leaks are the ones you don't intend — a value
+riding out in output you didn't think to check. Treat these as your own responsibility, because
+no tool will catch them for you:
+
+- **A command's output can contain a secret you never named.** Verbose/debug flags (`-v`,
+  `--debug`, `DEBUG=*`), stack traces, and error messages routinely echo the environment or a
+  config object. Before you quote *any* command's output back into your reply, scan it for a live
+  value. If a command might print one, don't run it with secrets in scope, or discard its output.
+- **Prefer per-command unlock over a session-wide one.** `envstow unlock -- <cmd>` puts the
+  secrets only in that one child — they are never in *your* environment, so nothing you run can
+  accidentally echo them. A bare `envstow unlock` (whole session unlocked) is riskier: every
+  command then inherits the secrets and any stray output can leak one. Use the scoped form by
+  default.
+- **Encoding is not laundering.** Base64/hex/JSON-embedding a value, or piping it through another
+  tool, still exposes it. `echo "$TOKEN" | base64` is a leak.
+- **Redirect-then-read still surfaces it.** Writing a value to a file and reading the file back,
+  or teeing output to a log you then display, puts the plaintext in your context just the same.
+- **Don't reconstruct a value from parts.** Concatenating a prefix you saw with the rest, or
+  quoting a "masked" value you managed to partially reveal, defeats the point.
+
+Rule of thumb: if plaintext could end up in your reply, a file, a commit, or a tool-call argument
+by *any* path — don't take that path. Reference the name; let `unlock` expand it in a child.
+
 ## Using a secret in a command (the main pattern)
 
 `envstow unlock -- <cmd>` runs one command with **every** secret set as an env var. Reference
@@ -148,7 +173,10 @@ https://github.com/jhnhnsn/envstow/blob/main/GUARDRAILS.md — a human or an age
 
 ## What you must never do
 
-- Never run `env`, `printenv`, `echo $SECRET`, `set`, or anything that dumps a value.
-- Never write a secret's value into a file, a commit, or your reply.
+- Never run `env`, `printenv`, `echo $SECRET`, `set`, `export -p`, or anything that dumps a value.
+- Never write a secret's value into a file, a commit, a log, or your reply — in any encoding.
+- Never quote command output into your reply without checking it holds no live value first.
+- Never run a verbose/debug command with secrets in scope just to read its output.
 - Never run `envstow get ... --show` on the human's behalf unless they explicitly ask to see it.
+- Never try to defeat `get`'s mask, or reconstruct a value from pieces.
 - If you think you truly need a plaintext value, **stop and ask the human.**
