@@ -15,6 +15,30 @@ command line.
 
 ---
 
+## The problem
+
+You have secrets a project needs — API keys, a database URL, deploy tokens — and every way of
+handling them has a catch:
+
+- A **`.env` file** is plaintext. You can't commit it, so onboarding a teammate means
+  out-of-band copying, and one stray `git add` leaks everything.
+- A **cloud secrets manager or SaaS** (Vault, Doppler, AWS/GCP/Azure) means an account, a server,
+  a network round-trip, and a bill — heavy for a small repo or a solo project, and useless
+  offline.
+- **Existing file-encryption tools** (SOPS, git-crypt) let you commit encrypted secrets, but need
+  external binaries and key backends set up, and none of them address the newest leak path: an
+  **AI coding agent** that reads a value into its context and echoes it into a transcript, a
+  commit, or a log.
+
+envstow is the small-footprint answer: **one binary, no server, no account.** Encrypt a key-value
+store to your collaborators' public keys and commit it to the repo (or keep it purely local).
+Everyone decrypts with their own key. Secrets are used strictly **by name** — the plaintext is
+injected into a child process's environment, never onto a command line, into your shell history,
+or into an agent's context. It's the "just commit the secrets, safely" option for repos and
+agents that don't need — or don't want — a secrets service.
+
+---
+
 ## How it works
 
 envstow's unit is a **folder**. Every command looks for `.envstow/` in the current directory and
@@ -35,6 +59,48 @@ call, or its transcript. You only ever type the variable **name**.
 If you commit `.envstow/`, everything in it is safe to share: the store is ciphertext and
 `recipients` holds only public keys. Your private key lives outside the folder and is never
 committed.
+
+---
+
+## How it compares
+
+envstow occupies a specific niche: **committed, encrypted secrets with no server and an
+AI-agent-safety layer.** It is not a secrets *service* and doesn't try to be — if you need central
+audit logs, automatic rotation, dynamic/short-lived credentials, or per-secret access control,
+one of the tools below is the right call, and this grid is meant to send you there honestly.
+
+| | **envstow** | SOPS (+age) | git-crypt | 1Password (`op`) | Doppler / Infisical | Vault / cloud KMS |
+|---|---|---|---|---|---|---|
+| **Where secrets live** | encrypted file in the repo/folder | encrypted file in the repo | encrypted file in the repo | hosted vault | hosted service | hosted server / cloud |
+| **Server or account?** | none | none | none | account (paid) | account (free tier + paid) | server / cloud account |
+| **Works offline** | ✅ | ✅ | ✅ | cached | cached | ❌ |
+| **Install footprint** | one binary, no deps | `sops` + a key backend | `git-crypt` + GPG | `op` CLI + app | CLI + account | CLI + infra |
+| **Commit secrets to git** | ✅ (ciphertext) | ✅ (ciphertext) | ✅ (ciphertext) | ❌ (refs only) | ❌ (refs only) | ❌ |
+| **Who can decrypt** | per-recipient age key | age/PGP/KMS keys | GPG or shared key | account / groups | teams / roles | IAM / policies |
+| **Run a cmd with secrets** | `unlock -- cmd` | `sops exec-env` | (files on disk) | `op run -- cmd` | `run -- cmd` | via SDK/CLI |
+| **Reference by name, value off the CLI** | ✅ core design | partial | ❌ (plaintext on disk) | ✅ (`op://…` refs) | ✅ | ✅ |
+| **AI-agent masking / leak guard** | ✅ built in | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Central audit log** | ❌ (git history only) | ❌ | ❌ | ✅ | ✅ | ✅ |
+| **Automatic rotation** | ❌ (manual + rotate at source) | ❌ | ❌ | partial | ✅ | ✅ |
+| **Access granularity** | whole store per recipient | whole file | whole file | per-item | per-secret | per-secret |
+| **Dynamic / short-lived secrets** | ❌ | ❌ | ❌ | ❌ | some | ✅ |
+| **Cost** | free (OSS) | free (OSS) | free (OSS) | paid | free tier + paid | infra + usage |
+
+**Reach for envstow when** you want to commit a repo's secrets safely, work offline or solo, add
+no infrastructure, and keep values out of an AI agent's context — and you're fine rotating
+secrets by hand and granting access at the whole-store level.
+
+**Reach for something else when:** you need a tamper-evident audit trail or automatic rotation
+(**Vault**, **Doppler**, cloud KMS); dynamic/leased credentials (**Vault**); per-secret access
+control across a large org (**Doppler**, **Infisical**, cloud KMS); or you already live in
+**1Password** and want its `op run` / `op://` references (very close in spirit to envstow's
+by-name model — just server-backed instead of committed). **SOPS** is the closest OSS cousin:
+same "encrypted file in git" idea, more backends and CI integrations, but external tooling to set
+up and no agent-safety layer. **git-crypt** is simplest but decrypts to plaintext in your working
+tree and has no by-name access.
+
+*(Feature details for hosted tools change over time; check their docs for specifics. This grid is
+about shape, not a point-in-time spec.)*
 
 ---
 
