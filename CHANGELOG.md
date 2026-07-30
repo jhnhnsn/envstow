@@ -2,7 +2,13 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
-## 0.1.26
+## 0.2.0
+
+A minor bump rather than a patch: `.envstow` changes what it *is* — a name that was always a
+directory can now also be a file. Existing repos are unaffected in the forward direction (a
+`.envstow/` directory resolves exactly as before), but the reverse isn't safe: an 0.1.x binary in
+a repo using a pointer file walks straight past it and reports "no recipients file found in this
+directory or any parent." The version signals that.
 
 ### Added
 - **Stores: the secret store no longer has to live in the repo.** Two new places it can live,
