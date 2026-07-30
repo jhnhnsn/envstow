@@ -2,6 +2,19 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
+## Unreleased
+
+### Fixed
+- **`init --store <name>` no longer forks a store this repo already points at.** Joining a
+  colleague's central-store project by running `envstow init --store acme` created a *second*,
+  empty store with the same name rather than an error — two stores, no sync, and nothing to say
+  they'd diverged. The local flow never had this problem because a git clone brings `recipients`
+  along, so `init` can see other people's keys and report "you're joining"; a central store isn't
+  cloned, so there was nothing on disk to notice. The pointer file is that evidence, and `init`
+  now trusts it: if the repo points at the named store and you don't have it, it stops and prints
+  your public key with the steps to actually join. Creating a differently-named store, or
+  re-running `init` when you *do* have the store, are unaffected.
+
 ## 0.2.0
 
 A minor bump rather than a patch: `.envstow` changes what it *is* — a name that was always a

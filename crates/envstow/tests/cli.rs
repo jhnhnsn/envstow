@@ -2080,3 +2080,67 @@ fn store_dir_points_at_an_arbitrary_directory() {
         .stdout
         .contains('S'));
 }
+
+#[test]
+fn init_refuses_to_fork_a_store_this_repo_already_points_at() {
+    // Joining a colleague's central-store project. The local flow catches this for free — a
+    // clone brings `recipients` along, so init sees other keys and says "you're joining." A
+    // central store isn't cloned, so without this guard init happily makes a SECOND empty store
+    // with the same name: two stores, no sync, and nothing to tell you they diverged.
+    let repo = Repo::new("fork-guard");
+    assert_eq!(
+        repo.run(&["init", "--store", "acme", "--no-skill"], "")
+            .code,
+        0
+    );
+    assert_eq!(repo.run(&["set", "SHARED"], "alice-val").code, 0);
+
+    // A second machine: same repo (same pointer), different identity AND config dir.
+    let other_cfg = repo.dir.join("other-cfg");
+    let other_id = repo.dir.join("other-id.txt");
+    let mut cmd = Command::new(BIN);
+    cmd.args(["init", "--store", "acme", "--no-skill"])
+        .current_dir(&repo.dir)
+        .env("ENVSTOW_IDENTITY", &other_id)
+        .env("XDG_CONFIG_HOME", &other_cfg)
+        .env("APPDATA", &other_cfg);
+    clear_agent_markers(&mut cmd);
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!out.status.success(), "must refuse, got: {err}");
+    assert!(
+        err.contains("already points at the central store 'acme'"),
+        "must name the store and the situation: {err}"
+    );
+    assert!(
+        err.contains("add-recipient"),
+        "must show how to actually join: {err}"
+    );
+    assert!(
+        !other_cfg.join("envstow/stores/acme/default.enc").is_file(),
+        "the divergent store must NOT have been created"
+    );
+
+    // The original store is untouched, and its owner can still re-init idempotently.
+    assert!(repo.run(&["list"], "").stdout.contains("SHARED"));
+    assert_eq!(
+        repo.run(&["init", "--store", "acme", "--no-skill"], "")
+            .code,
+        0,
+        "the owner (who HAS the store) must still be able to re-run init"
+    );
+
+    // A differently-named store here is a deliberate act, not a fork — still allowed.
+    let mut cmd = Command::new(BIN);
+    cmd.args(["init", "--store", "unrelated", "--no-skill"])
+        .current_dir(&repo.dir)
+        .env("ENVSTOW_IDENTITY", &other_id)
+        .env("XDG_CONFIG_HOME", &other_cfg)
+        .env("APPDATA", &other_cfg);
+    clear_agent_markers(&mut cmd);
+    assert!(
+        cmd.output().unwrap().status.success(),
+        "a different store name is not a fork"
+    );
+}

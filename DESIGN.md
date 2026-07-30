@@ -127,6 +127,23 @@ answerable without guessing. `envstow store` reports the resolved root and **why
 chosen; `unlock`/`run`/`env` name the store in their banner whenever it isn't a plain local
 `.envstow/` (for which the working directory already says it, and saying more would be noise).
 
+### Joining a central store
+
+A committed store travels with the repo. A central store does not — the pointer names it, but
+nothing transports it. That asymmetry produces one failure the local flow never had.
+
+`envstow init` distinguishes "creating a store" from "joining one" by reading `recipients`: if it
+already lists other people's keys, you're joining, and it says so rather than pretending you can
+decrypt. A git clone supplies that file for free. A central store has no clone step, so on a
+second machine the store directory is simply absent — and the naive path reads that as "nothing
+here yet, create it." The result was two stores with one name, neither aware of the other.
+
+The pointer is the missing evidence: it says *this project's secrets live in a store called
+`acme`*, which is exactly the fact that makes a local create wrong. So `init --store <name>`
+refuses when the repo already points at `<name>` and the store isn't on this machine, printing
+the public key and the join steps instead. Deliberately narrow — a different name, or a repo
+with no pointer, still creates; and once you have the store, `init` is idempotent again.
+
 ### What git was quietly providing
 
 Two things a non-git store loses, worth stating rather than discovering:

@@ -254,6 +254,16 @@ fn parse_pointer(text: &str) -> Result<String, LayoutError> {
     )))
 }
 
+/// The store name a pointer file's text names, or `None` if it isn't a readable pointer.
+///
+/// The lossy counterpart to [`parse_pointer`], for callers that are *asking whether* a pointer
+/// names something rather than resolving through one. `init` uses it to notice that a repo
+/// already points at the store being created; a malformed pointer is simply "not that store"
+/// there, since the resolving path will report it properly the moment anything reads a secret.
+pub fn parse_pointer_name(text: &str) -> Option<String> {
+    parse_pointer(text).ok()
+}
+
 /// Render a pointer file's contents, with a comment explaining it to whoever finds it.
 pub fn render_pointer(name: &str) -> String {
     format!(

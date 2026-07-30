@@ -563,6 +563,50 @@ fn cmd_init(args: &[String]) -> Cmd {
             store_root.display()
         )));
     }
+
+    // `init --store <name>` in a repo that ALREADY points at that store, on a machine that
+    // doesn't have it: this is someone joining a colleague's project, not starting a new one.
+    //
+    // The local flow catches the equivalent case for free — a git clone brings the store and its
+    // `recipients` along, so `init` sees other people's keys and reports "you're joining." A
+    // central store isn't cloned, so there is nothing on disk to notice, and the naive path
+    // cheerfully creates a SECOND empty store with the same name. Two stores, no sync, no
+    // warning: the user thinks they joined and has actually diverged.
+    //
+    // The pointer is the one piece of evidence that someone else's store exists. Trust it and
+    // stop, rather than manufacture a decoy.
+    if let layout::StoreSelector::Named(name) = &sel {
+        let pointer = cwd.join(layout::ENVSTOW_DIR);
+        let points_here = pointer
+            .is_file()
+            .then(|| std::fs::read_to_string(&pointer).ok())
+            .flatten()
+            .and_then(|t| layout::parse_pointer_name(&t))
+            .is_some_and(|n| &n == name);
+        if points_here && !store_root.join(layout::RECIPIENTS_NAME).is_file() {
+            return Err(AppError::msg(format!(
+                "this project already points at the central store '{name}', but you don't have \
+                 it yet.\n\
+                 \x20  Creating it here would make a SECOND, empty store with the same name — \
+                 not a copy\n\
+                 \x20  of your colleague's — and nothing would warn you they'd diverged.\n\
+                 \n\
+                 \x20  To join, send them your public key:\n\
+                 \x20    {public}\n\
+                 \x20  They run:  envstow add-recipient {public} <your-name>\n\
+                 \x20  …then send you their store directory (they can find it with \
+                 `envstow store`).\n\
+                 \x20  It goes here:\n\
+                 \x20    {}\n\
+                 \n\
+                 \x20  (Starting an unrelated store that happens to share the name? Use a \
+                 different\n\
+                 \x20   name, or delete {} first.)",
+                store_root.display(),
+                pointer.display()
+            )));
+        }
+    }
     if let Err(e) = std::fs::create_dir_all(&store_root) {
         return Err(AppError::msg(format!(
             "could not create {}: {e}",

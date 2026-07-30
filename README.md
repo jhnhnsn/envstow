@@ -485,8 +485,8 @@ created empty store at ~/.config/envstow/stores/acme/default.enc
 wrote /my-project/.envstow → central store 'acme' (safe to commit; contains no secrets)
 ```
 
-Nothing encrypted and no key material enters the working tree. What lands in the repo is a
-pointer file, and it's there so that ordinary commands need no flag:
+No ciphertext and no key material enters the working tree — only the pointer, which exists so
+ordinary commands need no flag:
 
 ```bash
 envstow set API_KEY        # resolves through the pointer — no --store needed
@@ -494,7 +494,7 @@ envstow list
 envstow run -- ./deploy
 ```
 
-The resulting layout:
+Layout:
 
 ```
 ~/.config/envstow/
@@ -506,58 +506,50 @@ The resulting layout:
       prod.enc          # profiles live inside a store: --store acme --profile prod
 ```
 
-The identity sits *beside* `stores/`, not in it, on purpose: colocating them would make one
-directory enough to decrypt everything in it, which an over-broad backup or a synced config
-folder would then carry whole.
+The identity sits *beside* `stores/` on purpose: together, one directory would be enough to
+decrypt everything in it — which an over-broad backup or a synced config folder would carry
+whole.
 
-**The pointer file** contains a name, not a path, and is safe to commit:
+The pointer holds a **name, not a path**, which is what makes it portable: it resolves under
+each person's own home directory, so it survives differing layouts and leaks nothing beyond the
+fact that envstow is in use.
 
 ```
-# envstow: this project's secrets live in a central store, NOT in this repo.
-# Each collaborator keeps their own copy at ~/.config/envstow/stores/acme/.
-# This file names it; it contains no secrets and is safe to commit.
 store: acme
 ```
-
-A name rather than a path is what makes it portable — it resolves under each person's own home
-directory, so it works on machines with different layouts and leaks nothing beyond the fact
-that envstow is in use.
 
 ### Sharing a central store
 
 **This is the part git was doing for you.** A committed store travels with the repo; a central
-store does not. The pointer names a store, but *nothing transports it* — you have to get the
-store's files to your collaborator yourself.
+store doesn't. The pointer names a store — nothing transports it.
 
-The trap to know about: running `envstow init --store acme` on a second machine does **not**
-join the first one. It creates a *different*, empty store that happens to share the name. Both
-are valid, neither is synced, and nothing warns you:
+So `init --store acme` in a repo already pointing at `acme`, on a machine without it, is a
+**join**, not a create. envstow refuses rather than make a second empty store with the same name:
 
 ```
-added you to ~/.config/envstow/stores/acme/recipients
-created empty store at ~/.config/envstow/stores/acme/default.enc
-pointer already exists at /my-project/.envstow
+envstow: this project already points at the central store 'acme', but you don't have it yet.
+   Creating it here would make a SECOND, empty store with the same name — not a copy
+   of your colleague's — and nothing would warn you they'd diverged.
+
+   To join, send them your public key:
+     age1kk8x4…
 ```
 
-The working flow is the usual recipient dance, plus a manual copy:
+The join, from a fresh clone:
 
 ```bash
-# Them — make a key (anywhere), send you the public half:
-envstow init --store acme      # creates their own empty 'acme'
-envstow pubkey                 # → age1kk8x4… they send you this
-
-# You — add them and re-encrypt:
-envstow add-recipient age1kk8x4… bob
-#   added recipient to ~/.config/envstow/stores/acme/recipients
-#   re-encrypted store to 2 recipient(s).
-
-# You — send them ~/.config/envstow/stores/acme/ (the whole directory).
-# Them — drop it in at the same path, replacing what init made. Now:
-envstow list                   # sees your secrets
+# Them:
+envstow pubkey                              # → age1kk8x4…  send it over
+                                            #   (`envstow init` first if they have no key yet)
+# You:
+envstow add-recipient age1kk8x4… bob        # adds + re-encrypts
+envstow store                               # find your store dir; send them that directory
+# Them: drop it at ~/.config/envstow/stores/acme/, then
+envstow list                                # your secrets
 ```
 
-If sharing is the main thing you need, a **shared folder** (below) is usually less work than
-copying a central store around — it makes the transport somebody else's problem.
+If sharing is the main thing you need, a **shared folder** (below) is less work — it makes
+transport somebody else's problem.
 
 ### An explicit path
 
