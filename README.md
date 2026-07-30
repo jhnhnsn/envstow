@@ -64,6 +64,10 @@ That's the whole loop. The public key is safe to share; the value never leaves a
 or a child process. Full walkthrough and the reasoning behind each step:
 **[ONBOARDING.md](./ONBOARDING.md)**.
 
+Don't want the store committed — a public repo, or collaborators with no git remote? Swap the
+first step for `envstow init --store <name>` and the store lives outside the repo entirely; see
+**[Stores](#stores)**.
+
 ---
 
 ## The problem
@@ -222,6 +226,10 @@ holding your public key, and an empty store. Idempotent.
 That's it if you're working **solo** — no git, no sharing, nothing else to do. The folder is the
 scope; `.envstow/` stays local until you decide otherwise.
 
+To keep the store out of the folder entirely — a public repo, or sharing via something other
+than git — `envstow init --store <name>` puts it in `~/.config/envstow/stores/<name>/` and
+leaves only a pointer file here. See [Stores](#stores).
+
 **Optional: one line in your shell rc.** Everything below works with the bare binary — envstow
 prints the exact `eval` line to run whenever your shell needs it. If you'd rather skip even
 that, add the shell hook to `~/.zshrc` / `~/.bashrc`:
@@ -367,6 +375,16 @@ Point `$ENVSTOW_IDENTITY` at a dedicated CI key (added as a recipient, stored as
 
 ```bash
 ENVSTOW_IDENTITY=/path/to/ci-key envstow run -- npm run deploy
+```
+
+That's the whole setup when the store is committed — the checkout brings it along. With a
+**central store** the runner has no copy, so put the store where the job can reach it and point
+at it by path:
+
+```bash
+ENVSTOW_IDENTITY=/path/to/ci-key \
+ENVSTOW_STORE_DIR=/path/to/store \
+  envstow run -- npm run deploy
 ```
 
 ### On Windows
@@ -675,6 +693,19 @@ break it for teammates who have updated.
 store that 0.1.9 has written reports `decryption failed: Header is invalid`. Everyone sharing a
 store needs to be on ≥ 0.1.9 — no re-init or migration beyond that. Stores made by older
 versions are read fine and are upgraded in place the first time anything writes them.
+
+**Pointer files need ≥ 0.2.0.** Central stores (and the `.envstow` *file* that points at one)
+arrived in 0.2.0. This is a change to what `.envstow` **is**, not to the store format, so the
+format guard above can't catch it: a `≤ 0.1.x` binary looks for `.envstow/recipients`, doesn't
+find it inside a file, and walks past — reporting
+
+```
+envstow: no `.envstow/recipients` file found in this directory or any parent (run `envstow init` first)
+```
+
+as though the repo didn't use envstow at all. Everyone working in a repo with a pointer file
+needs ≥ 0.2.0. Local `.envstow/` **directories** are unaffected in both directions and need no
+upgrade.
 
 ---
 
