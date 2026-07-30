@@ -65,10 +65,7 @@ fn main() {
     // Also accept `--store` / `--store-dir` here, same treatment: lifted into the environment
     // so the per-command resolve_store() sees them wherever they were written. Looping lets
     // them combine, e.g. `envstow --store acme --profile prod get X`.
-    loop {
-        let Some(first) = args.first().cloned() else {
-            break;
-        };
+    while let Some(first) = args.first().cloned() {
         let lift = |var: &str, args: &mut Vec<String>| {
             if args.len() >= 2 {
                 env::set_var(var, &args[1]);
