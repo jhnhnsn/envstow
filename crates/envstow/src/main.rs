@@ -554,12 +554,38 @@ fn cmd_init(args: &[String]) -> Cmd {
     // A local store must not collide with a pointer file of the same name — `.envstow` is one
     // or the other. Refuse rather than clobber: the pointer names a store that may hold the
     // only copy of someone's secrets.
+    //
+    // Which advice to give depends on whether the named store is actually on this machine, and
+    // the difference matters: a fresh clone carries the pointer but NOT the store, so telling
+    // that user to "add secrets with `envstow set`" sends them into an immediate second error.
+    // That's the common case — someone who just cloned and reflexively ran `init`.
     if matches!(sel, layout::StoreSelector::Discover) && store_root.is_file() {
+        let named = std::fs::read_to_string(&store_root)
+            .ok()
+            .and_then(|t| layout::parse_pointer_name(&t));
+        let next_step = match &named {
+            // The store is here: this repo is already set up, so there is nothing to init.
+            Some(n)
+                if layout::central_store_path(n)
+                    .join(layout::RECIPIENTS_NAME)
+                    .is_file() =>
+            {
+                "This repo already uses that store, and you have it — there's nothing to \
+                 initialize.\n\x20  Add secrets with `envstow set <NAME>`."
+                    .to_string()
+            }
+            // Named, but absent — you're joining. Send them to the one command that helps.
+            Some(n) => format!(
+                "You don't have that store yet, so `envstow set` won't work either.\n\
+                 \x20  Run `envstow init --store {n}` for the steps to join it."
+            ),
+            // Unreadable pointer: don't guess a store name, just say what's wrong.
+            None => "That file isn't a readable pointer — see `envstow store`.".to_string(),
+        };
         return Err(AppError::msg(format!(
             "{} is a pointer FILE naming a central store, not a local store directory.\n\
-             \x20  This repo already uses a central store — add secrets with `envstow set`, \
-             or remove\n\
-             \x20  the pointer file first if you really want a local store here.",
+             \x20  {next_step}\n\
+             \x20  (Really want a local store here instead? Delete the pointer file first.)",
             store_root.display()
         )));
     }

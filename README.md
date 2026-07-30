@@ -634,9 +634,19 @@ filesystem type tells them apart — the same trick git uses, where `.git` is a 
 `gitdir:` inside a worktree.
 
 One name to learn, and a repo has one or the other, never both — so "which store wins?" can't
-arise. `envstow init` refuses to turn a pointer into a local store rather than clobber it, since
-the pointer may name the only copy of someone's secrets. See
-[DESIGN.md](DESIGN.md#where-the-store-lives) for the full reasoning.
+arise. See [DESIGN.md](DESIGN.md#where-the-store-lives) for the full reasoning.
+
+**Running `init` in a repo that already carries a pointer** — the natural reflex after cloning —
+refuses rather than clobber it, since the pointer may name the only copy of someone's secrets.
+What it tells you next depends on whether you have that store:
+
+| | What `init` says |
+|---|---|
+| You have the store | Nothing to initialize — `envstow set <NAME>` |
+| You don't (a fresh clone) | `envstow init --store <name>` for the steps to join |
+| Pointer is unreadable | Says so; check `envstow store` |
+
+Genuinely want a local store here instead? Delete the pointer file first.
 
 ### Moving an existing store
 

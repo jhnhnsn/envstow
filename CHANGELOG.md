@@ -2,6 +2,18 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
+## Unreleased
+
+### Fixed
+- **`envstow init` in a repo carrying a pointer file now gives advice that works.** It correctly
+  refused to clobber the pointer, but always suggested "add secrets with `envstow set`" — which
+  fails immediately when the named store isn't on this machine. That's the *likeliest* way to
+  meet this error: clone a repo with a committed pointer, reflexively run `init`, and get sent
+  into a second failure with no mention of the command that actually helps. The message now
+  splits on whether the store is present: `envstow set` when it is, `envstow init --store <name>`
+  to join when it isn't, and a plain "that file isn't a readable pointer" when it can't be
+  parsed. All three still name the escape hatch (delete the pointer for a local store).
+
 ## 0.2.1
 
 ### Fixed

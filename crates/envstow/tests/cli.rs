@@ -2144,3 +2144,66 @@ fn init_refuses_to_fork_a_store_this_repo_already_points_at() {
         "a different store name is not a fork"
     );
 }
+
+#[test]
+fn plain_init_over_a_pointer_advises_by_whether_the_store_is_here() {
+    // Cloning a repo that carries a committed pointer and reflexively running `envstow init` is
+    // the likeliest way to meet this error, and in that case the store is NOT on the machine —
+    // so "add secrets with `envstow set`" would send the user straight into a second failure.
+    // The advice has to split on whether the named store actually exists.
+    let repo = Repo::new("ptr-init");
+    std::fs::write(repo.entry(), "store: acme\n").unwrap();
+
+    let absent = repo.run(&["init", "--no-skill"], "");
+    assert_ne!(absent.code, 0, "must refuse to clobber the pointer");
+    assert!(
+        absent.stderr.contains("init --store acme"),
+        "with the store absent, must point at the join command: {}",
+        absent.stderr
+    );
+    assert!(
+        !absent.stderr.contains("Add secrets with"),
+        "must NOT suggest `set`, which cannot work without the store: {}",
+        absent.stderr
+    );
+
+    // Now actually acquire the store the pointer names, and the advice should flip. Created from
+    // a directory WITHOUT that pointer — from inside this repo, the fork guard would (rightly)
+    // refuse, since a pointer plus a missing store means "join", not "create".
+    let elsewhere = repo.dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut cmd = Command::new(BIN);
+    cmd.args(["init", "--store", "acme", "--no-skill"])
+        .current_dir(&elsewhere)
+        .env("ENVSTOW_IDENTITY", &repo.identity)
+        .env("XDG_CONFIG_HOME", &repo.config)
+        .env("APPDATA", &repo.config);
+    clear_agent_markers(&mut cmd);
+    assert!(cmd.output().unwrap().status.success(), "create the store");
+    let present = repo.run(&["init", "--no-skill"], "");
+    assert_ne!(present.code, 0, "still refuses — there's nothing to init");
+    assert!(
+        present.stderr.contains("envstow set"),
+        "with the store present, `set` IS the right next step: {}",
+        present.stderr
+    );
+
+    // An unreadable pointer shouldn't guess a store name.
+    std::fs::write(repo.entry(), "garbage\n").unwrap();
+    let bad = repo.run(&["init", "--no-skill"], "");
+    assert_ne!(bad.code, 0);
+    assert!(
+        bad.stderr.contains("isn't a readable pointer"),
+        "must say the file is unreadable rather than invent a name: {}",
+        bad.stderr
+    );
+
+    // The escape hatch every branch advertises must actually work.
+    std::fs::remove_file(repo.entry()).unwrap();
+    assert_eq!(
+        repo.run(&["init", "--no-skill"], "").code,
+        0,
+        "deleting the pointer must allow a local store"
+    );
+    assert!(repo.entry().is_dir(), "…and that store is a directory");
+}
