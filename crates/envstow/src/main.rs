@@ -14,7 +14,8 @@
 //!   envstow status                  Show unlock state, profile, and loaded secret NAMES.
 //!   envstow upgrade [--check|--yes] Check for / install a newer envstow.
 //!   envstow scan-leak               PostToolUse hook: block tool output containing a live value.
-//!   envstow init                    Generate an identity, add self as recipient, create store.
+//!   envstow init [--store <name>]   Generate an identity, add self as recipient, create store.
+//!   envstow store                   Show which store is in effect (and why); list central ones.
 //!   envstow pubkey                  Print your age public key (share it to be added).
 //!   envstow add-recipient <age1..>  Add a recipient and re-encrypt the store.
 //!   envstow remove-recipient <k|nm> Remove a recipient and re-encrypt (then rotate!).
@@ -48,10 +49,10 @@ mod session;
 mod store;
 
 use agent::{mask, masked_preview, under_agent};
-use cli::{parse_simple, resolve_profile};
+use cli::{parse_simple, resolve_target};
 use error::AppError;
 use layout::Recipient;
-use store::{encrypt_payload, load_secrets, reencrypt_store, write_secrets};
+use store::{encrypt_payload, load_secrets_in, reencrypt_store, write_secrets};
 
 /// A command's result: `Ok(())` on success, or an [`AppError`] carrying the message and exit code.
 type Cmd = Result<(), AppError>;
@@ -61,15 +62,43 @@ fn main() {
     // Allow `--profile <name>` (or `--profile=<name>`) as a GLOBAL flag before the subcommand,
     // e.g. `envstow --profile prod set X`. We lift it into ENVSTOW_PROFILE so the per-command
     // resolve_profile() picks it up, then drop it from args so dispatch sees the subcommand.
-    if let Some(first) = args.first() {
-        if first == "--profile" {
+    // Also accept `--store` / `--store-dir` here, same treatment: lifted into the environment
+    // so the per-command resolve_store() sees them wherever they were written. Looping lets
+    // them combine, e.g. `envstow --store acme --profile prod get X`.
+    while let Some(first) = args.first().cloned() {
+        let lift = |var: &str, args: &mut Vec<String>| {
             if args.len() >= 2 {
-                env::set_var("ENVSTOW_PROFILE", &args[1]);
+                env::set_var(var, &args[1]);
                 args.drain(0..2);
+                true
+            } else {
+                false
             }
-        } else if let Some(name) = first.strip_prefix("--profile=") {
-            env::set_var("ENVSTOW_PROFILE", name);
-            args.remove(0);
+        };
+        let consumed = match first.as_str() {
+            "--profile" => lift("ENVSTOW_PROFILE", &mut args),
+            "--store" => lift("ENVSTOW_STORE", &mut args),
+            "--store-dir" => lift("ENVSTOW_STORE_DIR", &mut args),
+            _ => {
+                if let Some(v) = first.strip_prefix("--profile=") {
+                    env::set_var("ENVSTOW_PROFILE", v);
+                    args.remove(0);
+                    true
+                } else if let Some(v) = first.strip_prefix("--store=") {
+                    env::set_var("ENVSTOW_STORE", v);
+                    args.remove(0);
+                    true
+                } else if let Some(v) = first.strip_prefix("--store-dir=") {
+                    env::set_var("ENVSTOW_STORE_DIR", v);
+                    args.remove(0);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if !consumed {
+            break;
         }
     }
     // Commands that print their own output and always succeed (help/version) short-circuit here;
@@ -121,6 +150,7 @@ fn main() {
         Some("add-recipient") => cmd_add_recipient(&args[1..]),
         Some("remove-recipient") => cmd_remove_recipient(&args[1..]),
         Some("reencrypt") => cmd_reencrypt(&args[1..]),
+        Some("store") => cmd_store(&args[1..]),
         Some("profile") => cmd_profile(&args[1..]),
         Some("profiles") => cmd_profiles(),
         Some(other) => {
@@ -156,7 +186,7 @@ fn main() {
 ///   * stdout is a terminal (human at a shell) → mask; a bare terminal print is rarely wanted.
 ///   * stdout is a pipe / command substitution (and NOT under an agent) → print the value.
 fn cmd_get(args: &[String]) -> Cmd {
-    let (profile, args) = resolve_profile(args)?;
+    let (sel, profile, args) = resolve_target(args)?;
     let parsed = parse_simple(&args, &[("--show", "show")])?;
     let show = parsed.has("show");
     let Some(name) = parsed.positional else {
@@ -165,7 +195,7 @@ fn cmd_get(args: &[String]) -> Cmd {
         ));
     };
 
-    let secrets = load_secrets(&profile)?;
+    let secrets = load_secrets_in(&sel, &profile)?;
 
     // `secrets` (and thus every value, including the one we print below) is zeroized when it drops
     // at the end of this function — no manual scrubbing needed.
@@ -201,7 +231,7 @@ fn cmd_get(args: &[String]) -> Cmd {
 /// re-encrypting the store. Reading from stdin keeps the literal value off the command line.
 /// `--clipboard` reads the OS clipboard instead of stdin (same guarantee: never in argv).
 fn cmd_set(args: &[String]) -> Cmd {
-    let (profile, args) = resolve_profile(args)?;
+    let (sel, profile, args) = resolve_target(args)?;
     let parsed = parse_simple(
         &args,
         // `--export` is an internal flag used by the shell wrapper `unlock` installs: after
@@ -261,14 +291,14 @@ fn cmd_set(args: &[String]) -> Cmd {
 
     // From here `value` holds plaintext. On the two fallible steps before it's moved into the
     // store, scrub it explicitly on failure (a bare `?` would skip that).
-    let paths = match layout::locate(&profile) {
+    let paths = match layout::locate_in(&sel, &profile) {
         Ok(p) => p,
         Err(e) => {
             value.zeroize();
             return Err(e.into());
         }
     };
-    let mut secrets = match load_secrets(&profile) {
+    let mut secrets = match load_secrets_in(&sel, &profile) {
         Ok(v) => v,
         Err(e) => {
             value.zeroize();
@@ -397,7 +427,7 @@ fn read_clipboard() -> Result<String, String> {
 /// commit of the store to anyone who is (or was) a recipient, so a deleted secret is not a
 /// revoked one — hence the rotate reminder, mirroring `remove-recipient`.
 fn cmd_delete(args: &[String]) -> Cmd {
-    let (profile, args) = resolve_profile(args)?;
+    let (sel, profile, args) = resolve_target(args)?;
     let parsed = parse_simple(&args, &[("--force", "force"), ("-f", "force")])?;
     let force = parsed.has("force");
     let Some(name) = parsed.positional else {
@@ -406,8 +436,8 @@ fn cmd_delete(args: &[String]) -> Cmd {
         ));
     };
 
-    let paths = layout::locate(&profile)?;
-    let mut secrets = load_secrets(&profile)?;
+    let paths = layout::locate_in(&sel, &profile)?;
+    let mut secrets = load_secrets_in(&sel, &profile)?;
 
     if !secrets.contains(name) {
         return Err(AppError::msg(format!("no secret named '{name}'")));
@@ -443,8 +473,8 @@ fn cmd_delete(args: &[String]) -> Cmd {
 
 /// `envstow list` — print the variable NAMES in the store (never values).
 fn cmd_list(args: &[String]) -> Cmd {
-    let (profile, _args) = resolve_profile(args)?;
-    let secrets = load_secrets(&profile)?;
+    let (sel, profile, _args) = resolve_target(args)?;
+    let secrets = load_secrets_in(&sel, &profile)?;
     for name in secrets.names() {
         println!("{name}");
     }
@@ -469,8 +499,19 @@ fn cmd_pubkey() -> Cmd {
 /// `envstow init` — generate an age identity (if none), create the `recipients` file with the
 /// user as sole recipient (if none), and create an empty encrypted store (if none). Idempotent.
 /// Also offers to add the Claude Code agent skill to this repo (`--no-skill` to skip).
+///
+/// Three shapes, by where the store should live:
+///   * `envstow init` — a local `.envstow/` store beside the code, committed with it.
+///   * `envstow init --store <name>` — a central store at `~/.config/envstow/stores/<name>/`,
+///     plus a `.envstow` POINTER file in the CWD naming it. Nothing encrypted ever enters the
+///     working tree. This is the shape for a public repo, or for a store shared by some means
+///     other than git.
+///   * `envstow init --store-dir <path>` — a store at an arbitrary directory (a synced folder,
+///     say). No pointer is written: a path is machine-specific, so committing one would break
+///     for everyone else. Reach it with `--store-dir` or `$ENVSTOW_STORE_DIR`.
 fn cmd_init(args: &[String]) -> Cmd {
     let skip_skill = args.iter().any(|a| a == "--no-skill");
+    let (sel, _rest) = cli::resolve_store(args)?;
 
     // 1. Identity: reuse an existing one, else generate and write it.
     let public = match layout::read_identity_secret() {
@@ -503,16 +544,32 @@ fn cmd_init(args: &[String]) -> Cmd {
     };
     eprintln!("   your public key: {public}");
 
-    // 2. Recipients file under .envstow/ in the CWD (this becomes the repo root anchor).
-    let root = env::current_dir().unwrap_or_else(|_| ".".into());
-    // Ensure the .envstow/ dir exists before we write into it.
-    if let Err(e) = std::fs::create_dir_all(root.join(layout::ENVSTOW_DIR)) {
+    // 2. Decide where the store itself lives, and create that directory.
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let store_root = match &sel {
+        layout::StoreSelector::Named(name) => layout::central_store_path(name),
+        layout::StoreSelector::Dir(path) => path.clone(),
+        layout::StoreSelector::Discover => cwd.join(layout::ENVSTOW_DIR),
+    };
+    // A local store must not collide with a pointer file of the same name — `.envstow` is one
+    // or the other. Refuse rather than clobber: the pointer names a store that may hold the
+    // only copy of someone's secrets.
+    if matches!(sel, layout::StoreSelector::Discover) && store_root.is_file() {
         return Err(AppError::msg(format!(
-            "could not create {}: {e}",
-            layout::ENVSTOW_DIR
+            "{} is a pointer FILE naming a central store, not a local store directory.\n\
+             \x20  This repo already uses a central store — add secrets with `envstow set`, \
+             or remove\n\
+             \x20  the pointer file first if you really want a local store here.",
+            store_root.display()
         )));
     }
-    let recipients_path = root.join(layout::RECIPIENTS_FILE);
+    if let Err(e) = std::fs::create_dir_all(&store_root) {
+        return Err(AppError::msg(format!(
+            "could not create {}: {e}",
+            store_root.display()
+        )));
+    }
+    let recipients_path = store_root.join(layout::RECIPIENTS_NAME);
     let mut recipients = if recipients_path.is_file() {
         layout::read_recipients(&recipients_path).unwrap_or_default()
     } else {
@@ -547,8 +604,8 @@ fn cmd_init(args: &[String]) -> Cmd {
         eprintln!("added you to {}", recipients_path.display());
     }
 
-    // 3. Encrypted store: create an empty one if absent (the default profile → .envstow/default.enc).
-    let store_path = root.join(layout::STORE_FILE);
+    // 3. Encrypted store: create an empty one if absent (the default profile → default.enc).
+    let store_path = store_root.join(format!("{}.enc", layout::DEFAULT_PROFILE));
     if store_path.is_file() {
         eprintln!("store already exists at {}", store_path.display());
     } else {
@@ -568,11 +625,34 @@ fn cmd_init(args: &[String]) -> Cmd {
         }
     }
 
-    // 4. Offer to add the Claude Code agent skill to THIS repo (so it commits + travels to
+    // 4. For a central store, leave a pointer in the CWD so this project resolves to it with no
+    //    flag and no exported variable. Without it, every command here would need `--store`, and
+    //    forgetting would fall through to the walk — which for a public repo means quietly
+    //    finding some OTHER store, the exact outcome this setup exists to prevent.
+    if let layout::StoreSelector::Named(name) = &sel {
+        let pointer = cwd.join(layout::ENVSTOW_DIR);
+        if pointer.is_dir() {
+            eprintln!(
+                "⚠️  {} is a local store directory, so no pointer was written here.\n\
+                 \x20   Commands in this directory will use that local store, not '{name}'.",
+                pointer.display()
+            );
+        } else if pointer.is_file() {
+            eprintln!("pointer already exists at {}", pointer.display());
+        } else if let Err(e) = std::fs::write(&pointer, layout::render_pointer(name)) {
+            return Err(AppError::msg(format!("could not write pointer file: {e}")));
+        } else {
+            eprintln!(
+                "wrote {} → central store '{name}' (safe to commit; contains no secrets)",
+                pointer.display()
+            );
+        }
+    }
+
+    // 5. Offer to add the Claude Code agent skill to THIS repo (so it commits + travels to
     //    teammates). Prompts [Y/n]; --no-skill skips; non-interactive defaults to yes.
     if !skip_skill {
-        let repo_root = root.as_path();
-        maybe_install_skill(repo_root);
+        maybe_install_skill(cwd.as_path());
     }
 
     // Don't claim "Ready" when we just told them they can't decrypt yet. Someone joining a repo
@@ -650,7 +730,7 @@ fn maybe_install_skill(repo_root: &Path) {
 // ---------------------------------------------------------------------------
 
 fn cmd_add_recipient(args: &[String]) -> Cmd {
-    let (profile, args) = resolve_profile(args)?;
+    let (sel, profile, args) = resolve_target(args)?;
     let Some(key) = args.first() else {
         return Err(AppError::usage(
             "usage: envstow add-recipient <age1...> [label] [--profile P]",
@@ -663,7 +743,7 @@ fn cmd_add_recipient(args: &[String]) -> Cmd {
     }
     let label = args.get(1).cloned();
 
-    let paths = layout::locate(&profile)?;
+    let paths = layout::locate_in(&sel, &profile)?;
     let mut recipients = layout::read_recipients(&paths.recipients).unwrap_or_default();
     if recipients.iter().any(|r| &r.key == key) {
         // Already present is not an error — nothing to do.
@@ -685,14 +765,14 @@ fn cmd_add_recipient(args: &[String]) -> Cmd {
 }
 
 fn cmd_remove_recipient(args: &[String]) -> Cmd {
-    let (profile, args) = resolve_profile(args)?;
+    let (sel, profile, args) = resolve_target(args)?;
     let Some(target) = args.first() else {
         return Err(AppError::usage(
             "usage: envstow remove-recipient <age1...|label> [--profile P]",
         ));
     };
 
-    let paths = layout::locate(&profile)?;
+    let paths = layout::locate_in(&sel, &profile)?;
     let recipients = layout::read_recipients(&paths.recipients).unwrap_or_default();
 
     let matches: Vec<&Recipient> = recipients
@@ -735,8 +815,8 @@ fn cmd_remove_recipient(args: &[String]) -> Cmd {
 }
 
 fn cmd_reencrypt(args: &[String]) -> Cmd {
-    let (profile, _args) = resolve_profile(args)?;
-    let paths = layout::locate(&profile)?;
+    let (sel, profile, _args) = resolve_target(args)?;
+    let paths = layout::locate_in(&sel, &profile)?;
     let recipients = layout::read_recipients(&paths.recipients).unwrap_or_default();
     if recipients.is_empty() {
         return Err(AppError::msg("recipients file has no keys."));
@@ -788,6 +868,42 @@ fn cmd_profile(args: &[String]) -> Cmd {
             }
         }
         Err(_) => eprintln!("   (not inside an envstow repo)"),
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// stores
+// ---------------------------------------------------------------------------
+
+/// `envstow store` — say which store is in effect and WHY, and list the central ones.
+///
+/// The "why" is the point. With four ways to select a store (flag, env var, committed pointer,
+/// the walk), "am I about to write this secret where I think?" must be answerable without
+/// guessing — especially for the setup this feature exists for, where the wrong answer means a
+/// secret lands in a repo the user deliberately kept it out of.
+fn cmd_store(args: &[String]) -> Cmd {
+    let (sel, _rest) = cli::resolve_store(args)?;
+    match layout::resolve_root(&sel) {
+        Ok((root, source)) => {
+            println!("current store: {} ({})", root.display(), source.describe());
+            let profiles = layout::list_profiles(&root);
+            if !profiles.is_empty() {
+                eprintln!("profiles: {}", profiles.join(", "));
+            }
+        }
+        // Not an error worth exiting on: `envstow store` is the command you run precisely
+        // BECAUSE something isn't resolving. Print the reason and still list what exists.
+        Err(e) => eprintln!("current store: none — {e}"),
+    }
+    let central = layout::list_central_stores();
+    if central.is_empty() {
+        eprintln!(
+            "\ncentral stores: none yet ({})",
+            layout::central_stores_dir().display()
+        );
+    } else {
+        eprintln!("\ncentral stores: {}", central.join(", "));
     }
     Ok(())
 }
@@ -859,6 +975,7 @@ fn print_help() {
          \x20 envstow status                   Show whether you're unlocked, the profile, and secret NAMES.\n\
          \x20 envstow shell-init               Print the optional shell hook for your rc: eval \"$(envstow shell-init)\".\n\
          \x20 envstow init [--no-skill]        Create identity + recipients + store; add agent skill.\n\
+         \x20 envstow store                    Show which store is in effect (and why); list stores.\n\
          \x20 envstow add-recipient <age1..>   Add a collaborator and re-encrypt.\n\
          \x20 envstow remove-recipient <k|nm>  Remove a collaborator and re-encrypt (then rotate).\n\
          \x20 envstow reencrypt                Re-encrypt the store to the current recipients.\n\
@@ -870,6 +987,16 @@ fn print_help() {
          \n\
          Profiles: add `--profile <name>` to any command to use a separate secret set\n\
          (e.g. dev/staging/prod), or set $ENVSTOW_PROFILE. Default is `default`.\n\
+         \n\
+         Stores: by default your secrets live in `.envstow/` beside your code, committed with\n\
+         it. To keep them OUT of the repo (a public repo, or sharing via a synced folder rather\n\
+         than git), use a central store instead:\n\
+         \x20 envstow init --store <name>      Store lives in ~/.config/envstow/stores/<name>/;\n\
+         \x20                                  a `.envstow` pointer file (no secrets) is written\n\
+         \x20                                  here so commands in this repo need no flag.\n\
+         \x20 envstow init --store-dir <path>  Store lives at any path (e.g. a shared folder).\n\
+         Select one explicitly with `--store <name>` / `--store-dir <path>`, or $ENVSTOW_STORE /\n\
+         $ENVSTOW_STORE_DIR. `envstow store` says which one is in effect.\n\
          \n\
          EXAMPLES:\n\
          \x20 envstow set MY_TOKEN --clipboard         # store a secret straight from the clipboard\n\

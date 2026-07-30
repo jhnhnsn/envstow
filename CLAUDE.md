@@ -6,6 +6,11 @@ name** so their plaintext never has to be pasted onto a command line. All crypto
 crate compiled into the `envstow` binary — there are no external tools (`sops`/`age` CLIs) to
 install or invoke.
 
+(A store can also live outside the repo — `~/.config/envstow/stores/<name>/` via a committed
+`.envstow` pointer file, or any path via `--store-dir`. This repo uses the committed
+`.envstow/` directory; `envstow store` reports which is in effect. Everything below applies
+identically either way.)
+
 ## Secret handling — MANDATORY
 
 - Refer to secrets by their variable **name** only (e.g. `$FLY_API_TOKEN`). Never paste,
@@ -42,6 +47,8 @@ install or invoke.
   with `--clipboard`. Both keep the value off the command line.
 - `envstow delete <NAME>` — remove one secret and re-encrypt (`--force` to skip the prompt).
 - `envstow list` — list secret **names** (never values).
+- `envstow store` — show which store is in effect and why; list central stores. Safe (paths and
+  names only).
 - After any store change (`set`/`delete`) made **inside** an unlocked shell, the running
   shell still holds the old values — `exit` and `envstow unlock` again to pick up the change.
   (`eval "$(envstow refresh)"` can unset deleted names in place, but `exit` + `unlock` is the

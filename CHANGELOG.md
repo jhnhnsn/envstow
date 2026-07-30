@@ -2,6 +2,50 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
+## 0.1.26
+
+### Added
+- **Stores: the secret store no longer has to live in the repo.** Two new places it can live,
+  for the cases where a committed `.envstow/` is wrong or impossible — a **public repo** whose
+  owner doesn't want a permanent world-downloadable ciphertext record (or a public list of
+  collaborators in `recipients`), and **collaborators with no git remote**, sharing a folder
+  over Drive/Dropbox/Syncthing.
+  - `envstow init --store <name>` creates the store at `~/.config/envstow/stores/<name>/` and
+    writes a small `.envstow` **pointer file** into the repo. Nothing encrypted, and no key
+    material, enters the working tree.
+  - `envstow init --store-dir <path>` creates it at any path — a synced folder, say. No pointer
+    is written, since a path wouldn't resolve on anyone else's machine.
+  - Select one on any command with `--store <name>` / `--store-dir <path>`, or `$ENVSTOW_STORE`
+    / `$ENVSTOW_STORE_DIR`.
+- **`.envstow` is now a file *or* a directory** — a directory holds a local store (unchanged), a
+  file contains `store: <name>` pointing at a central one. Same trick git uses for worktrees,
+  where `.git` is a file holding `gitdir:`. One name to learn, and a repo can't ambiguously be
+  both. The pointer holds a **name, not a path**, which is what makes it safe to commit: it
+  resolves under each collaborator's own home directory and leaks nothing.
+- **Each store has its own `recipients`.** Profiles share one recipient list (right: dev/staging/
+  prod are one team); stores don't (right: unrelated projects aren't). This is the thing
+  `--store` provides that a profile never could.
+- **`envstow store`** — says which store is in effect **and why**, and lists central stores.
+  With four ways to select one, "am I about to write this secret where I think?" needs an
+  answer that isn't a guess. `unlock`/`run`/`env` now name the store in their banner too,
+  whenever it isn't a plain local `.envstow/`.
+
+### Changed
+- **Errors that assumed git no longer do.** The "ask a recipient to re-encrypt" and corrupt-store
+  messages checked nothing before telling you to `git pull` / `git add .envstow` — advice that
+  can't work for a store deliberately kept out of the repo. They now detect whether the store is
+  actually in a work tree. "No store found" additionally lists your central stores, since being
+  outside a repo that points at one is the likeliest reason you're seeing it.
+- **A missing store is always an error, never a fallback.** Naming a store that isn't there —
+  by flag, env var, or a pointer whose store you don't have — fails and lists the stores that do
+  exist. It never falls through to walking up the tree, which could otherwise hand you a
+  different store than you asked for. For the public-repo case that store would be precisely the
+  local one the user moved their secrets out of.
+
+Existing repos are unaffected: a `.envstow/` directory resolves exactly as before, and plain
+`envstow init` still creates one. See [DESIGN.md](DESIGN.md#where-the-store-lives) for the
+reasoning behind the layout, and the README's [Stores](README.md#stores) section for usage.
+
 ## 0.1.25
 
 ### Changed

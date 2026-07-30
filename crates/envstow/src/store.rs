@@ -11,10 +11,10 @@ use crate::error::AppError;
 use crate::layout::{self, Recipient};
 use crate::secrets::Secrets;
 
-/// Decrypt the located store for `profile` with the user's identity into a [`Secrets`] (whose
+/// Decrypt the selected store for `profile` with the user's identity into a [`Secrets`] (whose
 /// values are zeroized on drop).
-pub fn load_secrets(profile: &str) -> Result<Secrets, AppError> {
-    let paths = layout::locate(profile)?;
+pub fn load_secrets_in(sel: &layout::StoreSelector, profile: &str) -> Result<Secrets, AppError> {
+    let paths = layout::locate_in(sel, profile)?;
     let secret = layout::read_identity_secret()?;
     let identity = crypto::parse_identity(&secret)?;
     // A missing store for a NAMED profile means the profile doesn't exist — point the user at
@@ -68,27 +68,62 @@ fn explain_decrypt_failure(original: String, secret: &str, recipients_path: &Pat
         .map(|rs| rs.iter().any(|r| r.key == public))
         .unwrap_or(false);
 
+    // How the re-keyed store gets BACK to you depends on how this store is shared. A committed
+    // store travels by git; a central or synced-folder store does not, and telling someone to
+    // `git pull` a store that was deliberately kept out of the repo is worse than saying
+    // nothing — it's advice that can't work, for a setup they chose on purpose.
+    let committed = is_committed_store(recipients_path);
     if listed {
+        let rekey = if committed {
+            "git pull && envstow reencrypt && git add .envstow && git commit && git push"
+        } else {
+            "envstow reencrypt   (then re-share the updated store)"
+        };
         format!(
             "your key is listed in `{}`, but the store wasn't encrypted to it yet.\n\
              \x20  The store is re-keyed only when someone runs a re-encrypt. Ask an existing \
              recipient to:\n\
-             \x20    git pull && envstow reencrypt && git add .envstow && git commit && git push\n\
+             \x20    {rekey}\n\
              \x20  (Adding a key to `recipients` alone does not grant access — that file is an \
              input to\n\
              \x20   encryption, not an access list.)",
             recipients_path.display()
         )
     } else {
+        let after = if committed {
+            "…then `git pull` once they've pushed."
+        } else {
+            "…then get the updated store from them."
+        };
         format!(
             "your key isn't a recipient of this store, so you can't decrypt it yet.\n\
              \x20  Your public key:\n\
              \x20    {public}\n\
              \x20  Send it to someone who already has access and ask them to run:\n\
              \x20    envstow add-recipient {public} <your-name>\n\
-             \x20  …then `git pull` once they've pushed."
+             \x20  {after}"
         )
     }
+}
+
+/// Whether this store looks like a committed, git-distributed one — i.e. it sits in a
+/// `.envstow/` directory inside a git work tree. Used only to pick which "how do I get the
+/// re-keyed store" advice to print; a wrong guess costs a slightly-off hint, never correctness.
+fn is_committed_store(recipients_path: &Path) -> bool {
+    let Some(root) = recipients_path.parent() else {
+        return false;
+    };
+    if root.file_name().and_then(|n| n.to_str()) != Some(layout::ENVSTOW_DIR) {
+        return false;
+    }
+    let mut dir = root.parent();
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 /// Serialize `secrets` to dotenv, encrypt to the current recipients, and write the store.

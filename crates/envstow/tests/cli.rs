@@ -43,6 +43,9 @@ fn clear_agent_markers(cmd: &mut Command) {
 struct Repo {
     dir: PathBuf,
     identity: PathBuf,
+    /// A private config dir for this test. Central stores resolve under it, so a test that
+    /// creates one can never touch the developer's real `~/.config/envstow/stores/`.
+    config: PathBuf,
 }
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -58,7 +61,22 @@ impl Repo {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp repo");
         let identity = dir.join("identity.txt");
-        Repo { dir, identity }
+        let config = dir.join("config");
+        Repo {
+            dir,
+            identity,
+            config,
+        }
+    }
+
+    /// The path a central store called `name` resolves to for THIS test.
+    fn central_store(&self, name: &str) -> PathBuf {
+        self.config.join("envstow").join("stores").join(name)
+    }
+
+    /// This repo's `.envstow` entry — a directory for a local store, a file for a pointer.
+    fn entry(&self) -> PathBuf {
+        self.dir.join(".envstow")
     }
 
     /// Run `envstow <args...>` in this repo with this identity, feeding `stdin_data` to stdin.
@@ -69,6 +87,10 @@ impl Repo {
         cmd.args(args)
             .current_dir(&self.dir)
             .env("ENVSTOW_IDENTITY", &self.identity)
+            // Central stores resolve under the config dir; pin it into this test's temp dir so
+            // nothing here can reach (or create) a store in the developer's real ~/.config.
+            .env("XDG_CONFIG_HOME", &self.config)
+            .env("APPDATA", &self.config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -97,6 +119,10 @@ impl Repo {
         cmd.args(args)
             .current_dir(&self.dir)
             .env("ENVSTOW_IDENTITY", &self.identity)
+            // Central stores resolve under the config dir; pin it into this test's temp dir so
+            // nothing here can reach (or create) a store in the developer's real ~/.config.
+            .env("XDG_CONFIG_HOME", &self.config)
+            .env("APPDATA", &self.config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1778,4 +1804,279 @@ fn run_requires_a_command() {
         flags_only.code, 0,
         "flags without a command are not a command"
     );
+}
+
+// ---------------------------------------------------------------------------
+// store resolution: local vs central, and the `.envstow` file-or-directory rule
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_with_a_store_name_keeps_everything_out_of_the_repo() {
+    // The public-repo case: nothing encrypted may enter the working tree. What lands in the
+    // repo is a pointer FILE naming the store; the ciphertext and recipients live centrally.
+    let repo = Repo::new("central-init");
+    let out = repo.run(&["init", "--store", "acme", "--no-skill"], "");
+    assert_eq!(out.code, 0, "init --store failed: {}", out.stderr);
+
+    let entry = repo.entry();
+    assert!(
+        entry.is_file(),
+        "`.envstow` in the repo must be a FILE (a pointer), not a store dir"
+    );
+    let text = std::fs::read_to_string(&entry).unwrap();
+    assert!(
+        text.contains("store: acme"),
+        "pointer names the store: {text}"
+    );
+    assert!(
+        !text.contains("age1"),
+        "a pointer must not contain key material: {text}"
+    );
+
+    // The store itself is central, and complete.
+    let central = repo.central_store("acme");
+    assert!(
+        central.join("recipients").is_file(),
+        "central recipients created"
+    );
+    assert!(
+        central.join("default.enc").is_file(),
+        "central store created"
+    );
+
+    // Nothing encrypted anywhere in the repo — the whole point.
+    for e in std::fs::read_dir(&repo.dir).unwrap().flatten() {
+        assert_ne!(
+            e.path().extension().and_then(|s| s.to_str()),
+            Some("enc"),
+            "no ciphertext may be written into the repo: {:?}",
+            e.path()
+        );
+    }
+}
+
+#[test]
+fn a_pointer_file_resolves_with_no_flag_at_all() {
+    // The reason the pointer exists: after init, ordinary commands in this repo just work.
+    // If this needed `--store` every time, forgetting it would fall through to the walk.
+    let repo = Repo::new("central-use");
+    assert_eq!(
+        repo.run(&["init", "--store", "acme", "--no-skill"], "")
+            .code,
+        0
+    );
+
+    assert_eq!(repo.run(&["set", "TOKEN"], "s3cr3t").code, 0);
+    let listed = repo.run(&["list"], "");
+    assert!(
+        listed.stdout.contains("TOKEN"),
+        "set/list via pointer: {}",
+        listed.stdout
+    );
+
+    // And the value round-trips through the child environment.
+    let got = repo.run(&["run", "--", "sh", "-c", "printf '%s' \"$TOKEN\""], "");
+    assert_eq!(
+        got.stdout, "s3cr3t",
+        "value round-trips via the central store"
+    );
+
+    // A subdirectory still resolves — the walk finds the pointer above it.
+    let sub = repo.dir.join("nested/deep");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mut cmd = Command::new(BIN);
+    cmd.args(["list"])
+        .current_dir(&sub)
+        .env("ENVSTOW_IDENTITY", &repo.identity)
+        .env("XDG_CONFIG_HOME", &repo.config)
+        .env("APPDATA", &repo.config);
+    clear_agent_markers(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("TOKEN"),
+        "the walk must find a pointer from a subdirectory too"
+    );
+}
+
+#[test]
+fn a_dangling_pointer_fails_loudly_instead_of_finding_another_store() {
+    // Clone a repo whose central store you don't have. The failure must NAME the store and say
+    // how to get one — never silently resolve elsewhere, which for this feature's whole purpose
+    // would mean falling back to a store the user meant to avoid.
+    let repo = Repo::new("dangling");
+    std::fs::write(repo.entry(), "store: notmine\n").unwrap();
+
+    let out = repo.run(&["list"], "");
+    assert_ne!(out.code, 0, "a dangling pointer must fail");
+    assert!(
+        out.stderr.contains("notmine") && out.stderr.contains("init --store notmine"),
+        "must name the store and the fix: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_malformed_pointer_is_an_error_not_a_fallthrough() {
+    let repo = Repo::new("badpointer");
+    std::fs::write(repo.entry(), "this is not a pointer\n").unwrap();
+
+    let out = repo.run(&["list"], "");
+    assert_ne!(out.code, 0, "an unreadable pointer must fail");
+    assert!(
+        out.stderr.contains("store: <name>"),
+        "must show the expected format: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_local_store_still_works_exactly_as_before() {
+    // The backward-compatibility guarantee: plain `init` is untouched by any of this.
+    let repo = Repo::new("local-still");
+    assert_eq!(repo.run(&["init", "--no-skill"], "").code, 0);
+    assert!(repo.entry().is_dir(), "plain init still makes a DIRECTORY");
+    assert!(repo.store().is_file(), "…containing the store");
+    assert_eq!(repo.run(&["set", "K"], "v").code, 0);
+    assert!(repo.run(&["list"], "").stdout.contains("K"));
+}
+
+#[test]
+fn init_refuses_to_clobber_a_pointer_with_a_local_store() {
+    // `.envstow` is a file OR a directory, never both. A plain `init` on top of a pointer must
+    // refuse: the pointer may name the only copy of someone's secrets.
+    let repo = Repo::new("clobber");
+    assert_eq!(
+        repo.run(&["init", "--store", "acme", "--no-skill"], "")
+            .code,
+        0
+    );
+
+    let out = repo.run(&["init", "--no-skill"], "");
+    assert_ne!(out.code, 0, "plain init over a pointer must refuse");
+    assert!(
+        out.stderr.contains("pointer"),
+        "must explain why: {}",
+        out.stderr
+    );
+    assert!(repo.entry().is_file(), "the pointer must survive untouched");
+}
+
+#[test]
+fn stores_have_separate_recipients_and_separate_secrets() {
+    // The axis `--store` adds that `--profile` never had: profiles share one recipients file,
+    // stores do not. Two stores must be fully independent.
+    let repo = Repo::new("two-stores");
+    assert_eq!(
+        repo.run(&["init", "--store", "one", "--no-skill"], "").code,
+        0
+    );
+    // Second init in a fresh dir so the pointer doesn't collide; same identity + config.
+    let other = repo.dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let mut cmd = Command::new(BIN);
+    cmd.args(["init", "--store", "two", "--no-skill"])
+        .current_dir(&other)
+        .env("ENVSTOW_IDENTITY", &repo.identity)
+        .env("XDG_CONFIG_HOME", &repo.config)
+        .env("APPDATA", &repo.config);
+    clear_agent_markers(&mut cmd);
+    assert!(cmd.output().unwrap().status.success(), "second store init");
+
+    assert_eq!(repo.run(&["--store", "one", "set", "A"], "one-val").code, 0);
+    assert_eq!(repo.run(&["--store", "two", "set", "B"], "two-val").code, 0);
+
+    let one = repo.run(&["--store", "one", "list"], "").stdout;
+    let two = repo.run(&["--store", "two", "list"], "").stdout;
+    assert!(
+        one.contains('A') && !one.contains('B'),
+        "store one sees only its own: {one}"
+    );
+    assert!(
+        two.contains('B') && !two.contains('A'),
+        "store two sees only its own: {two}"
+    );
+
+    // Separate recipients files, not a shared one.
+    assert!(repo.central_store("one").join("recipients").is_file());
+    assert!(repo.central_store("two").join("recipients").is_file());
+}
+
+#[test]
+fn an_unknown_store_name_lists_the_real_ones() {
+    let repo = Repo::new("typo");
+    assert_eq!(
+        repo.run(&["init", "--store", "acme", "--no-skill"], "")
+            .code,
+        0
+    );
+
+    let out = repo.run(&["--store", "acmee", "list"], "");
+    assert_ne!(out.code, 0, "a typo'd store must not silently resolve");
+    assert!(
+        out.stderr.contains("acme"),
+        "must list what does exist so the typo is obvious: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn store_command_reports_which_store_is_in_effect_and_why() {
+    // With four ways to select a store, "am I writing where I think?" must be answerable.
+    let repo = Repo::new("store-cmd");
+    assert_eq!(
+        repo.run(&["init", "--store", "acme", "--no-skill"], "")
+            .code,
+        0
+    );
+
+    let out = repo.run(&["store"], "");
+    assert_eq!(out.code, 0, "store command failed: {}", out.stderr);
+    let all = format!("{}{}", out.stdout, out.stderr);
+    assert!(all.contains("acme"), "names the store: {all}");
+    assert!(
+        all.contains("via") || all.contains(".envstow"),
+        "says WHY it resolved that way: {all}"
+    );
+}
+
+#[test]
+fn store_and_store_dir_together_is_refused() {
+    // Passing both is a mistake about which store you're touching — stop rather than pick.
+    let repo = Repo::new("bothflags");
+    let out = repo.run(&["--store", "a", "--store-dir", "/tmp/x", "list"], "");
+    assert_ne!(out.code, 0);
+    assert!(
+        out.stderr.contains("not both"),
+        "must say only one may be given: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn store_dir_points_at_an_arbitrary_directory() {
+    // The shared-folder case (Drive/Dropbox/Syncthing): a store that is neither in the repo nor
+    // in the central area, reached by path.
+    let repo = Repo::new("storedir");
+    let shared = repo.dir.join("Synced Folder");
+    let shared_s = shared.to_string_lossy().to_string();
+
+    let out = repo.run(&["init", "--store-dir", &shared_s, "--no-skill"], "");
+    assert_eq!(out.code, 0, "init --store-dir failed: {}", out.stderr);
+    assert!(
+        shared.join("default.enc").is_file(),
+        "store created in the given dir"
+    );
+    assert!(
+        !repo.entry().exists(),
+        "a PATH must not be committed as a pointer — it wouldn't resolve on another machine"
+    );
+
+    assert_eq!(
+        repo.run(&["--store-dir", &shared_s, "set", "S"], "v").code,
+        0
+    );
+    assert!(repo
+        .run(&["--store-dir", &shared_s, "list"], "")
+        .stdout
+        .contains('S'));
 }
