@@ -2,7 +2,7 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
-## Unreleased
+## 0.2.1
 
 ### Fixed
 - **`init --store <name>` no longer forks a store this repo already points at.** Joining a
@@ -14,6 +14,16 @@ All notable changes to envstow are documented here. Versions follow [SemVer](htt
   now trusts it: if the repo points at the named store and you don't have it, it stops and prints
   your public key with the steps to actually join. Creating a differently-named store, or
   re-running `init` when you *do* have the store, are unaffected.
+
+### Documentation
+- **Stores is now a top-level README section**, covering what 0.2.0 shipped: the three kinds of
+  store side by side, the pointer file, the `stores/`-beside-`identity.txt` layout and why,
+  selection precedence, `envstow store`, the file-or-directory rule, a migration recipe, and the
+  compatibility boundary. Every quoted command and error output is verified against the binary.
+- **The 0.2.0 compatibility boundary is written down** — an `≤ 0.1.x` binary in a repo with a
+  pointer file reports `no `.envstow/recipients` file found`, as though envstow weren't in use.
+  The store-format guard can't catch it, since this changed what `.envstow` *is* rather than the
+  store bytes. Local `.envstow/` directories are unaffected in both directions.
 
 ## 0.2.0
 
