@@ -5,14 +5,20 @@ description: Use envstow to access encrypted secrets in a repo that uses it — 
 
 # Using envstow
 
-envstow manages secrets as an **age-encrypted key-value store** (`.envstow/default.enc`)
-committed to a repo. `envstow` is a single self-contained binary — no `sops`/`age` CLIs needed.
-Secrets are used **by name**; their plaintext must never enter your output, a tool-call
-argument, or a file.
+envstow manages secrets as an **age-encrypted key-value store**. `envstow` is a single
+self-contained binary — no `sops`/`age` CLIs needed. Secrets are used **by name**; their
+plaintext must never enter your output, a tool-call argument, or a file.
 
-**Does this repo use envstow?** It does if there's a `.envstow/recipients` file and `.envstow/default.enc`
-at the repo root (`envstow list` succeeds). If not, this skill doesn't apply — the repo may use
-a plain `.env` or another secrets tool.
+**Does this repo use envstow?** It does if `envstow list` succeeds — that's the reliable check.
+There are two layouts, and you don't need to care which is in play:
+- a `.envstow/` **directory** holding the store, committed with the repo; or
+- a `.envstow` **file** containing `store: <name>`, pointing at a store outside the repo (used
+  when the store shouldn't be committed, e.g. a public repo). `envstow store` shows which.
+
+If `envstow list` fails, this skill doesn't apply — the repo may use a plain `.env` or another
+secrets tool. One exception: if it reports a **dangling pointer** (a `.envstow` file naming a
+store that isn't on this machine), envstow *is* in use and the human needs to create or obtain
+that store. Tell them; don't try to work around it.
 
 ## The one rule
 
@@ -71,6 +77,7 @@ value yourself.
 ```bash
 envstow list          # prints the NAMES of stored secrets (never values) — safe
 envstow status        # are you in an unlocked shell? which profile? which names are live? — safe
+envstow store         # which store is in effect, and why (paths + names only) — safe
 ```
 
 Use `list` to learn which names exist before referencing them. Use `status` to check whether the

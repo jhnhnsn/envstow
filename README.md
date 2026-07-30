@@ -103,6 +103,10 @@ walks up to find it. Git is optional — it's just how the folder travels to oth
                                   #   Windows: %APPDATA%\envstow\identity.txt
 ```
 
+The store doesn't have to live in the repo. If you'd rather keep it out — a public repo, or
+collaborators who share a folder instead of a git remote — a **central store** lives in your
+config directory and the repo holds only a pointer to it. See [Stores](#stores).
+
 To *use* a secret you unlock it into a **child process**. The child gets the value in its
 environment and does its job; the value never appears in your shell history, an agent's tool
 call, or its transcript. You only ever type the variable **name**.
@@ -399,6 +403,66 @@ stays one line per key); `unlock`/`get` decode them transparently, so the env va
 sees is the exact original. Single-line secrets are stored as-is. Pasting a multi-line value
 into the interactive prompt won't work — pipe it (`cat key.pem | envstow set TLS_KEY`).
 
+### Stores
+
+By default the store lives in `.envstow/` beside your code and is committed with it. Git
+already handles distribution and history, so that's the simplest thing that works — and it
+stays the default.
+
+Two situations where you'd rather it didn't:
+
+- **A public repo.** The store is ciphertext, so publishing it isn't a plaintext leak — but it
+  *is* a permanent, world-downloadable copy, and `recipients` publicly lists your
+  collaborators.
+- **No git.** People sharing a folder over Drive/Dropbox/Syncthing.
+
+For both, use a **central store**: it lives in your config directory, addressed by name, and
+the repo gets only a small pointer file.
+
+```bash
+envstow init --store acme          # store → ~/.config/envstow/stores/acme/
+                                   # repo  → a `.envstow` file containing `store: acme`
+envstow set API_KEY                # …then everything works as usual, no flag needed
+envstow store                      # which store is in effect, and why
+```
+
+The pointer file is safe to commit: it contains a **name**, not a path and not any key
+material. Each collaborator runs `envstow init --store acme` once on their own machine, and the
+name resolves under their own home directory.
+
+```
+~/.config/envstow/
+  identity.txt          # your private key — deliberately NOT in stores/
+  stores/
+    acme/
+      recipients        # this store's collaborators (its own, not shared with other stores)
+      default.enc
+```
+
+For a store that's neither in the repo nor in the config dir — a synced folder, say — use a
+path instead. No pointer is written, since a path wouldn't resolve on anyone else's machine:
+
+```bash
+envstow init --store-dir ~/"Google Drive/team-secrets"
+envstow --store-dir ~/"Google Drive/team-secrets" set API_KEY
+export ENVSTOW_STORE_DIR=~/"Google Drive/team-secrets"   # …or make it sticky
+```
+
+**Selection precedence:** `--store-dir <path>` > `--store <name>` > `ENVSTOW_STORE_DIR` >
+`ENVSTOW_STORE` > a `.envstow` file or directory found by walking up > error. Naming a store
+that doesn't exist is always an **error** listing the ones that do — it never silently falls
+back to searching, which could otherwise hand you a different store than you asked for.
+
+`.envstow` is a **directory** for a local store and a **file** for a pointer — the same trick
+git uses, where `.git` is a file in a worktree. A repo therefore has one or the other, never
+both. See [DESIGN.md](DESIGN.md#where-the-store-lives) for the reasoning.
+
+> **Two things git was doing for you.** With a shared folder, simultaneous `envstow set`s can
+> clobber each other (git would have refused the push) and there's no history to recover a bad
+> `delete` from beyond whatever your sync service keeps. Coordinate writes, or use git.
+
+---
+
 ### Profiles
 
 A repo can hold multiple secret sets — e.g. `dev`, `staging`, `prod` — as separate encrypted
@@ -424,7 +488,8 @@ env var > `default`. Using a profile that doesn't exist errors and tells you to
 
 | Command | Purpose |
 |---|---|
-| `envstow init` | Generate identity, create `recipients` + empty store in this folder. Idempotent. |
+| `envstow init [--store <name>\|--store-dir <path>]` | Generate identity, create `recipients` + empty store. Default: in this folder. With `--store`, centrally, leaving only a pointer here. Idempotent. |
+| `envstow store` | Show which store is in effect **and why**; list central stores. |
 | `envstow set <NAME> [--clipboard]` | Store a value read from **stdin**, or the OS clipboard with `--clipboard` (`-c`). Never in argv either way. |
 | `envstow delete <NAME> [--force]` | Remove one secret; re-encrypt (then **rotate**). Confirms on a TTY. |
 | `envstow get <NAME> [--show]` | Resolve one secret by name. **Masked under an agent** unless `--show`. |
@@ -444,9 +509,11 @@ env var > `default`. Using a profile that doesn't exist errors and tells you to
 | `envstow upgrade [--check\|--yes]` | Upgrade envstow to the latest release (`--check` just reports). |
 | `envstow profiles` | List available profiles. |
 | `--profile <name>` | (On any command) use a separate secret set; see [Profiles](#profiles). |
+| `--store <name>` / `--store-dir <path>` | (On any command) use a different store; see [Stores](#stores). |
 
 **Environment:** `ENVSTOW_IDENTITY` overrides the identity path (default
-`~/.config/envstow/identity.txt`). `ENVSTOW_AGENT=1` forces agent-masking for `get` in tools
+`~/.config/envstow/identity.txt`). `ENVSTOW_STORE` / `ENVSTOW_STORE_DIR` select a store by name
+or path (see [Stores](#stores)). `ENVSTOW_AGENT=1` forces agent-masking for `get` in tools
 that aren't auto-detected. Inside an `envstow unlock` subshell, `ENVSTOW_UNLOCKED=1` is set —
 use it to show an "unlocked" indicator in your prompt (below).
 

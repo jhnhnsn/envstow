@@ -9,10 +9,26 @@ use std::process::{Command, Stdio};
 
 use zeroize::Zeroize;
 
-use crate::cli::{parse_simple, resolve_profile};
+use crate::cli::{parse_simple, resolve_target};
 use crate::error::AppError;
 use crate::secrets::Secrets;
-use crate::store::load_secrets;
+use crate::store::load_secrets_in;
+
+/// How to name the source of a load: the profile alone for a plain local store, or the profile
+/// plus which store it came from for anything else.
+///
+/// The moment secrets go live in an environment is the moment to be sure they came from where
+/// you meant. A local `.envstow/` is the unambiguous case and saying so would just be noise —
+/// but a central store, an explicit `--store-dir`, or a committed pointer all mean the secrets
+/// came from somewhere the working directory alone doesn't tell you, so those say it out loud.
+fn describe_source(sel: &crate::layout::StoreSelector, profile: &str) -> String {
+    match crate::layout::locate_in(sel, profile) {
+        Ok(p) if p.source != crate::layout::StoreSource::LocalDir => {
+            format!("{profile} ({})", p.source.describe())
+        }
+        _ => profile.to_string(),
+    }
+}
 
 /// `envstow unlock` — decrypt the whole store and open an interactive SUBSHELL with every value
 /// set as an env var; `exit` locks. Values never printed; only variable NAMES are listed.
@@ -22,7 +38,7 @@ use crate::store::load_secrets;
 /// `unlock -- <cmd>` used to be the one-shot form; it moved to `run` in 0.1.24 and any trailing
 /// args now get a redirect rather than silently overlapping with `run`.
 pub fn cmd_unlock(args: &[String]) -> crate::Cmd {
-    let (profile, args) = resolve_profile(args)?;
+    let (sel, profile, args) = resolve_target(args)?;
     if !args.is_empty() {
         return Err(AppError::usage(
             "`unlock -- <cmd>` moved — use `envstow run [--only NAME,...] -- <cmd>`.\n\
@@ -30,7 +46,7 @@ pub fn cmd_unlock(args: &[String]) -> crate::Cmd {
         ));
     }
 
-    let secrets = load_secrets(&profile)?;
+    let secrets = load_secrets_in(&sel, &profile)?;
     if secrets.is_empty() {
         return Err(AppError::msg("store decrypted but contains no variables."));
     }
@@ -39,7 +55,7 @@ pub fn cmd_unlock(args: &[String]) -> crate::Cmd {
     eprintln!(
         "envstow: loaded {} secret(s) from {}: {}",
         names.len(),
-        profile,
+        describe_source(&sel, &profile),
         names.join(", ")
     );
     warn_on_shadowed(&secrets);
@@ -57,7 +73,7 @@ pub fn cmd_unlock(args: &[String]) -> crate::Cmd {
 /// missing variable would fail later and further from the cause. `ENVSTOW_LOADED` reflects the
 /// scoped set, so `status` and the leak guard see exactly what's live.
 pub fn cmd_run(args: &[String]) -> crate::Cmd {
-    let (profile, args) = resolve_profile(args)?;
+    let (sel, profile, args) = resolve_target(args)?;
 
     // Leading `run` flags end at `--` or the first non-flag token; everything from there is the
     // command, so its own flags (`flyctl deploy --verbose`) pass through untouched.
@@ -94,7 +110,7 @@ pub fn cmd_run(args: &[String]) -> crate::Cmd {
         ));
     }
 
-    let mut secrets = load_secrets(&profile)?;
+    let mut secrets = load_secrets_in(&sel, &profile)?;
     if secrets.is_empty() {
         return Err(AppError::msg("store decrypted but contains no variables."));
     }
@@ -117,7 +133,7 @@ pub fn cmd_run(args: &[String]) -> crate::Cmd {
     eprintln!(
         "envstow: loaded {} secret(s) from {}: {}",
         names.len(),
-        profile,
+        describe_source(&sel, &profile),
         names.join(", ")
     );
     warn_on_shadowed(&secrets);
@@ -335,7 +351,7 @@ pub fn cmd_status(args: &[String]) -> crate::Cmd {
 /// Only names in `ENVSTOW_LOADED` are considered, so a `DATABASE_URL` from your shell rc is never
 /// touched — envstow only unsets what it set.
 pub fn cmd_refresh(args: &[String]) -> crate::Cmd {
-    let (profile, args) = resolve_profile(args)?;
+    let (sel, profile, args) = resolve_target(args)?;
     if let Some(a) = args.first() {
         return Err(AppError::usage(format!("unexpected argument '{a}'")));
     }
@@ -346,7 +362,7 @@ pub fn cmd_refresh(args: &[String]) -> crate::Cmd {
         ));
     }
 
-    let secrets = load_secrets(&profile)?;
+    let secrets = load_secrets_in(&sel, &profile)?;
 
     // Stale = envstow set it here, and the store no longer has it. Note we compare against the
     // names WE recorded, not the whole environment, so we never unset someone else's var.
@@ -427,7 +443,7 @@ pub fn cmd_refresh(args: &[String]) -> crate::Cmd {
 /// code is inert no matter what the store holds. `--off` prints only `unset` lines (names, never
 /// values), so it carries neither guard's risk and needs no store or key at all.
 pub fn cmd_env(args: &[String]) -> crate::Cmd {
-    let (profile, args) = resolve_profile(args)?;
+    let (sel, profile, args) = resolve_target(args)?;
     let parsed = parse_simple(&args, &[("--off", "off")])?;
     if let Some(a) = parsed.positional {
         return Err(AppError::usage(format!("unexpected argument '{a}'")));
@@ -453,7 +469,7 @@ pub fn cmd_env(args: &[String]) -> crate::Cmd {
         return env_off();
     }
 
-    let secrets = load_secrets(&profile)?;
+    let secrets = load_secrets_in(&sel, &profile)?;
     if secrets.is_empty() {
         return Err(AppError::msg("store decrypted but contains no variables."));
     }
@@ -505,7 +521,7 @@ pub fn cmd_env(args: &[String]) -> crate::Cmd {
     eprintln!(
         "envstow: loaded {} secret(s) from {} into this shell: {}",
         loaded.len(),
-        profile,
+        describe_source(&sel, &profile),
         loaded.join(", ")
     );
     if !stale.is_empty() {

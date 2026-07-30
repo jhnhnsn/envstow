@@ -1,35 +1,79 @@
 //! envstow file & key layout — where the identity, recipients, and encrypted store live,
 //! and how they are located, read, and written.
 //!
-//! Locations (all repo files live under `.envstow/` at the repo root)
+//! Locations
 //! ---------
 //!   * Identity (PRIVATE key): `$ENVSTOW_IDENTITY`, else `~/.config/envstow/identity.txt`
 //!     (`%APPDATA%\envstow\identity.txt` on Windows). Contains one `AGE-SECRET-KEY-...` line.
 //!     Never committed; created mode 0600 on Unix.
-//!   * Recipients (PUBLIC keys): `.envstow/recipients`. Committed. One `age1...` per line;
-//!     `#` comments and optional trailing `# Name` allowed. Shared across all profiles.
-//!   * Encrypted stores: `.envstow/<profile>.enc`, one per profile. Committed. The default
-//!     profile is `.envstow/default.enc`. Each file is an `envstow-format: <n>` header line
+//!   * Recipients (PUBLIC keys): `<store root>/recipients`. One `age1...` per line;
+//!     `#` comments and optional trailing `# Name` allowed. Shared across all profiles of a
+//!     store, but NOT across stores — each store has its own collaborators.
+//!   * Encrypted stores: `<store root>/<profile>.enc`, one per profile. The default
+//!     profile is `default.enc`. Each file is an `envstow-format: <n>` header line
 //!     followed by the age payload; the decrypted plaintext is dotenv. The header is checked
 //!     before decryption so a store from a newer envstow reports that plainly instead of
 //!     failing as a decryption error — see [`FORMAT_VERSION`].
 //!
-//! The repo root is whatever directory (walking up from the CWD) contains a `.envstow/recipients`
-//! file — that anchors the stores and any relative operations.
+//! Where the store root comes from
+//! -------------------------------
+//! Two kinds of store, resolved by [`resolve_root`]:
+//!
+//!   * **Local** — `.envstow/` beside your code, found by walking up from the CWD. This is
+//!     envstow's original and still default model: the store is committed with the repo, so it
+//!     travels to collaborators the same way the code does.
+//!   * **Central** — `~/.config/envstow/stores/<name>/`, addressed by NAME rather than path.
+//!     For work where a committed store is wrong or impossible: a public repo whose owner does
+//!     not want a permanent ciphertext record in it, or collaborators sharing a synced folder
+//!     rather than a git remote.
+//!
+//! `.envstow` is a file OR a directory
+//! -----------------------------------
+//! A repo that uses a central store still needs to say so, or every command needs a flag. It
+//! does that with a `.envstow` FILE (rather than a directory) containing `store: <name>`.
+//! Same name, and the filesystem type discriminates — this is exactly what git does for
+//! worktrees and submodules, where `.git` is a file holding `gitdir: <path>`.
+//!
+//! Using one name for both cases is what keeps the model small: a path is a file or a
+//! directory, never both, so "this repo has a local store AND a pointer to a central one" is
+//! unrepresentable rather than an ambiguity to resolve. The alternative — a pointer at
+//! `.envstow/store`, beside the stores — would have needed a rule for that collision, and any
+//! rule that silently picks a winner picks the wrong store some of the time. In a secrets tool
+//! that is the failure worth designing out.
+//!
+//! The pointer holds a NAME, not a path, which is what makes it safe to commit: it resolves
+//! under each collaborator's own home directory, leaks nothing beyond the fact that envstow is
+//! in use, and doesn't break when someone's layout differs.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// All envstow files for a repo live in this directory at the repo root.
+/// A repo's envstow entry: a directory holding a local store, or a file pointing at a central
+/// one. See the module docs for why one name covers both.
 pub const ENVSTOW_DIR: &str = ".envstow";
-/// The recipients file, relative to the repo root (inside `.envstow/`).
-pub const RECIPIENTS_FILE: &str = ".envstow/recipients";
-/// The default profile's store, relative to the repo root. Named `default.enc` so the file
-/// tells you which profile it is.
-pub const STORE_FILE: &str = ".envstow/default.enc";
 /// The name of the default (unnamed) profile.
 pub const DEFAULT_PROFILE: &str = "default";
+/// The recipients file's basename, resolved against whatever store root is in effect.
+pub const RECIPIENTS_NAME: &str = "recipients";
+
+/// Central stores live under this directory, beside — deliberately NOT inside — the directory
+/// holding the identity key.
+///
+/// Colocating stores with `identity.txt` would make one directory sufficient to decrypt
+/// everything in it: an over-broad backup, a synced config dir, or a dotfiles repo that
+/// symlinks `~/.config` would carry both halves at once. Today each half is useless alone —
+/// the key decrypts nothing by itself, the ciphertext opens for no one without it. The
+/// `stores/` subdirectory keeps that true while still putting everything envstow owns in one
+/// findable place.
+pub const STORES_SUBDIR: &str = "stores";
+
+/// The pointer file's field prefix: `store: <name>`.
+///
+/// A prefixed key rather than a bare name, mirroring git's `gitdir:`. A bare value would leave
+/// nowhere to add a second field later, and would make an empty or truncated file
+/// indistinguishable from a missing one — the prefix turns both into a clear parse error.
+const POINTER_PREFIX: &str = "store:";
 
 /// Where to send someone whose envstow is too old to read a store.
 pub const REPO_URL: &str = "https://github.com/jhnhnsn/envstow";
@@ -84,11 +128,6 @@ fn split_format_header(bytes: &[u8]) -> Result<(u32, &[u8]), LayoutError> {
     Ok((version, &rest[nl + 1..]))
 }
 
-/// The store filename for a given profile, relative to the repo root: `.envstow/<profile>.enc`.
-pub fn store_file_for(profile: &str) -> String {
-    format!("{ENVSTOW_DIR}/{profile}.enc")
-}
-
 /// Validate a profile name: non-empty, and only chars safe as a filename component (so it can't
 /// escape the `.envstow/` dir or collide with the `.enc` suffix). `recipients` is reserved.
 pub fn valid_profile_name(name: &str) -> bool {
@@ -97,6 +136,211 @@ pub fn valid_profile_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Validate a central store name. Same rules as a profile name — it becomes a single directory
+/// component under `stores/`, so it must not be able to escape it (`..`, `/`) or be empty.
+pub fn valid_store_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Where a store root came from. Carried alongside the resolved path so commands can *say*
+/// which store they acted on and why — a silently-relocated secret store is a bad thing to
+/// have to debug, and "did it use the store I meant?" should never need guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreSource {
+    /// `--store-dir <path>` or `$ENVSTOW_STORE_DIR`.
+    ExplicitDir,
+    /// `--store <name>` or `$ENVSTOW_STORE` → a central store.
+    NamedFlag(String),
+    /// A committed `.envstow` pointer file naming a central store.
+    Pointer { name: String, from: PathBuf },
+    /// A `.envstow/` directory found by walking up from the CWD — the original model.
+    LocalDir,
+}
+
+impl StoreSource {
+    /// A short human phrase for status output, mirroring `profile`'s "from $ENVSTOW_PROFILE".
+    pub fn describe(&self) -> String {
+        match self {
+            StoreSource::ExplicitDir => "from --store-dir".to_string(),
+            StoreSource::NamedFlag(n) => format!("central store '{n}'"),
+            StoreSource::Pointer { name, from } => {
+                format!("central store '{name}', via {}", from.display())
+            }
+            StoreSource::LocalDir => "local .envstow/ directory".to_string(),
+        }
+    }
+}
+
+/// How the caller asked for a store, before it is resolved to a path. Built by the CLI layer
+/// from flags and environment; [`resolve_root`] turns it into a real directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StoreSelector {
+    /// No explicit selection — walk up from the CWD and use whatever is found.
+    #[default]
+    Discover,
+    /// An explicit central store name.
+    Named(String),
+    /// An explicit directory, used as the store root verbatim.
+    Dir(PathBuf),
+}
+
+/// The root directory of the central stores area: `~/.config/envstow/stores/`.
+///
+/// Derived from the identity path's parent so the two always agree about where envstow's
+/// config lives, including under `$XDG_CONFIG_HOME` or `%APPDATA%`. `$ENVSTOW_IDENTITY` is a
+/// deliberate exception: it relocates only the key, not the stores, since the whole point of
+/// keeping them apart is that they need not travel together.
+pub fn central_stores_dir() -> PathBuf {
+    config_dir().join(STORES_SUBDIR)
+}
+
+/// The path of a central store by name.
+pub fn central_store_path(name: &str) -> PathBuf {
+    central_stores_dir().join(name)
+}
+
+/// List the central store names that exist, sorted. A directory counts as a store only if it
+/// has a `recipients` file — a half-created or stray directory is not offered as a choice.
+pub fn list_central_stores() -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(entries) = fs::read_dir(central_stores_dir()) {
+        for e in entries.flatten() {
+            if e.path().join(RECIPIENTS_NAME).is_file() {
+                names.push(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Parse a `.envstow` pointer file's contents into the central store name it names.
+///
+/// Accepts blank lines and `#` comments so the file can carry a note explaining itself to
+/// whoever finds it in a clone. Anything else — no `store:` line, an empty value, an invalid
+/// name — is an error rather than a fallback: a pointer we can't read must not silently
+/// degrade into "no store here", which would send the caller to some other store entirely.
+fn parse_pointer(text: &str) -> Result<String, LayoutError> {
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let Some(value) = t.strip_prefix(POINTER_PREFIX) else {
+            return Err(LayoutError::BadPointer(format!(
+                "expected a `{POINTER_PREFIX} <name>` line, found `{t}`"
+            )));
+        };
+        let name = value.trim();
+        if name.is_empty() {
+            return Err(LayoutError::BadPointer(format!(
+                "`{POINTER_PREFIX}` has no store name after it"
+            )));
+        }
+        if !valid_store_name(name) {
+            return Err(LayoutError::BadPointer(format!(
+                "invalid store name '{name}' (use letters, digits, - or _)"
+            )));
+        }
+        return Ok(name.to_string());
+    }
+    Err(LayoutError::BadPointer(format!(
+        "no `{POINTER_PREFIX} <name>` line found"
+    )))
+}
+
+/// Render a pointer file's contents, with a comment explaining it to whoever finds it.
+pub fn render_pointer(name: &str) -> String {
+    format!(
+        "# envstow: this project's secrets live in a central store, NOT in this repo.\n\
+         # Each collaborator keeps their own copy at ~/.config/envstow/stores/{name}/.\n\
+         # This file names it; it contains no secrets and is safe to commit.\n\
+         {POINTER_PREFIX} {name}\n"
+    )
+}
+
+/// Walk up from the CWD looking for a `.envstow` entry, and resolve it to a store root.
+///
+/// One probe per level, then branch on what was found:
+///   * a directory → a local store, rooted there (envstow's original behavior, unchanged);
+///   * a file      → a pointer naming a central store.
+///
+/// Nearest wins, so a nested project overrides an outer one, matching how the walk has always
+/// behaved and how git resolves `.git`.
+fn discover_root() -> Result<(PathBuf, StoreSource), LayoutError> {
+    let mut dir = env::current_dir().map_err(|e| LayoutError::Io(e.to_string()))?;
+    loop {
+        let cand = dir.join(ENVSTOW_DIR);
+        match fs::metadata(&cand) {
+            Ok(meta) if meta.is_dir() => {
+                // A directory without `recipients` is not a store — it's an unrelated directory
+                // that happens to share the name, or a half-finished init. Keep walking rather
+                // than claiming this level, so an outer real store still wins.
+                if cand.join(RECIPIENTS_NAME).is_file() {
+                    return Ok((cand, StoreSource::LocalDir));
+                }
+            }
+            Ok(_) => {
+                let text = fs::read_to_string(&cand).map_err(|e| LayoutError::Io(e.to_string()))?;
+                let name = parse_pointer(&text)?;
+                let root = central_store_path(&name);
+                if !root.join(RECIPIENTS_NAME).is_file() {
+                    return Err(LayoutError::PointerDangling {
+                        name,
+                        from: cand,
+                        expected: root,
+                    });
+                }
+                return Ok((
+                    root,
+                    StoreSource::Pointer {
+                        name,
+                        from: cand.clone(),
+                    },
+                ));
+            }
+            Err(_) => {}
+        }
+        if !dir.pop() {
+            return Err(LayoutError::NoRecipientsFile);
+        }
+    }
+}
+
+/// Resolve a [`StoreSelector`] to a concrete store root plus the reason it was chosen.
+///
+/// An explicit selection never falls back to the walk. If you named a store and it isn't there,
+/// that is an error — quietly walking instead could hand you a different store than the one you
+/// asked for, and in the case this feature exists for (keeping secrets OUT of a public repo)
+/// the store it would find is precisely the one you were avoiding.
+pub fn resolve_root(sel: &StoreSelector) -> Result<(PathBuf, StoreSource), LayoutError> {
+    match sel {
+        StoreSelector::Dir(path) => {
+            if !path.join(RECIPIENTS_NAME).is_file() {
+                return Err(LayoutError::NoStoreAtDir(path.clone()));
+            }
+            Ok((path.clone(), StoreSource::ExplicitDir))
+        }
+        StoreSelector::Named(name) => {
+            if !valid_store_name(name) {
+                return Err(LayoutError::BadStoreName(name.clone()));
+            }
+            let root = central_store_path(name);
+            if !root.join(RECIPIENTS_NAME).is_file() {
+                return Err(LayoutError::NoSuchStore {
+                    name: name.clone(),
+                    known: list_central_stores(),
+                });
+            }
+            Ok((root, StoreSource::NamedFlag(name.clone())))
+        }
+        StoreSelector::Discover => discover_root(),
+    }
 }
 
 /// A parsed recipient entry: the `age1...` key plus an optional human label from a trailing
@@ -110,7 +354,7 @@ pub struct Recipient {
 #[derive(Debug)]
 pub enum LayoutError {
     NoRecipientsFile,
-    NoStore,
+    NoStore(PathBuf),
     Io(String),
     NoIdentity(PathBuf),
     Empty(&'static str),
@@ -124,18 +368,50 @@ pub enum LayoutError {
     },
     /// The header is present but unparseable — a truncated or corrupted file.
     BadFormatHeader,
+    /// A `.envstow` pointer file exists but can't be read as one.
+    BadPointer(String),
+    /// A pointer names a central store that isn't on this machine.
+    PointerDangling {
+        name: String,
+        from: PathBuf,
+        expected: PathBuf,
+    },
+    /// `--store <name>` named a central store that doesn't exist.
+    NoSuchStore {
+        name: String,
+        known: Vec<String>,
+    },
+    /// `--store-dir <path>` pointed somewhere that isn't a store.
+    NoStoreAtDir(PathBuf),
+    /// A store name that can't be a directory component.
+    BadStoreName(String),
 }
 
 impl std::fmt::Display for LayoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LayoutError::NoRecipientsFile => write!(
-                f,
-                "no `{RECIPIENTS_FILE}` file found in this directory or any parent \
-                 (run `envstow init` first)"
-            ),
-            LayoutError::NoStore => {
-                write!(f, "no `{STORE_FILE}` found next to `{RECIPIENTS_FILE}`")
+            LayoutError::NoRecipientsFile => {
+                let known = list_central_stores();
+                write!(
+                    f,
+                    "no `{ENVSTOW_DIR}` found in this directory or any parent \
+                     (run `envstow init` first)"
+                )?;
+                if !known.is_empty() {
+                    // They have central stores — most likely they meant one of them and are
+                    // simply outside a repo that points at it. Naming them turns a dead end
+                    // into a next step.
+                    write!(
+                        f,
+                        "\n\x20  Central stores on this machine: {}\n\
+                         \x20  Use one with `envstow --store <name> ...`",
+                        known.join(", ")
+                    )?;
+                }
+                Ok(())
+            }
+            LayoutError::NoStore(p) => {
+                write!(f, "no store file at {}", p.display())
             }
             LayoutError::Io(e) => write!(f, "{e}"),
             LayoutError::NoIdentity(p) => write!(
@@ -162,58 +438,99 @@ impl std::fmt::Display for LayoutError {
             LayoutError::BadFormatHeader => write!(
                 f,
                 "the store's `{}` header is malformed — the file looks truncated or corrupted. \
-                 Restore it from git history (`git checkout -- .envstow/`).",
+                 Restore it from a backup, or from git history if the store is committed \
+                 (`git checkout -- {ENVSTOW_DIR}`).",
                 FORMAT_PREFIX.trim_end()
             ),
+            LayoutError::BadPointer(why) => write!(
+                f,
+                "the `{ENVSTOW_DIR}` file is not a valid store pointer: {why}.\n\
+                 \x20  A pointer file contains one line: `{POINTER_PREFIX} <name>`.\n\
+                 \x20  (A `{ENVSTOW_DIR}` DIRECTORY holds a store directly; a FILE points at a \
+                 central one.)"
+            ),
+            LayoutError::PointerDangling {
+                name,
+                from,
+                expected,
+            } => write!(
+                f,
+                "{} points at the central store '{name}', which isn't on this machine.\n\
+                 \x20  Expected it at: {}\n\
+                 \x20  Create it with `envstow init --store {name}`, or get a copy from \
+                 whoever shares it with you.",
+                from.display(),
+                expected.display()
+            ),
+            LayoutError::NoSuchStore { name, known } => {
+                write!(f, "no central store named '{name}'.")?;
+                if known.is_empty() {
+                    write!(
+                        f,
+                        "\n\x20  There are no central stores yet — create one with \
+                         `envstow init --store {name}`."
+                    )
+                } else {
+                    write!(f, "\n\x20  Known stores: {}", known.join(", "))
+                }
+            }
+            LayoutError::NoStoreAtDir(p) => write!(
+                f,
+                "no `{RECIPIENTS_NAME}` file in {} — that directory isn't an envstow store.\n\
+                 \x20  Create one there with `envstow init --store-dir {}`.",
+                p.display(),
+                p.display()
+            ),
+            LayoutError::BadStoreName(n) => {
+                write!(f, "invalid store name '{n}' (use letters, digits, - or _)")
+            }
         }
     }
 }
 
 impl std::error::Error for LayoutError {}
 
-/// Resolved paths for a repo: the recipients file and the encrypted store beside it.
+/// Resolved paths for a store: the recipients file and the encrypted store beside it, plus
+/// where the store root came from so commands can report it.
 pub struct Paths {
     pub recipients: PathBuf,
     pub store: PathBuf,
+    pub source: StoreSource,
 }
 
-/// Walk up from the CWD to find the `recipients` file that anchors the repo; derive the store
-/// path for `profile` beside it. Does not require the store to exist yet (init creates it).
-/// All profiles share the one `recipients` file.
+/// Resolve the store root for `sel` and derive the paths for `profile` inside it. Does not
+/// require the profile's store file to exist yet (init and `profile create` create it).
+/// All profiles of a store share its one `recipients` file.
+pub fn locate_in(sel: &StoreSelector, profile: &str) -> Result<Paths, LayoutError> {
+    let (root, source) = resolve_root(sel)?;
+    Ok(Paths {
+        recipients: root.join(RECIPIENTS_NAME),
+        store: root.join(format!("{profile}.enc")),
+        source,
+    })
+}
+
+/// [`locate_in`] with the default selector — walk up from the CWD. Kept for the call sites that
+/// have no selector of their own.
 pub fn locate(profile: &str) -> Result<Paths, LayoutError> {
-    let mut dir = env::current_dir().map_err(|e| LayoutError::Io(e.to_string()))?;
-    loop {
-        let cand = dir.join(RECIPIENTS_FILE);
-        if cand.is_file() {
-            return Ok(Paths {
-                store: dir.join(store_file_for(profile)),
-                recipients: cand,
-            });
-        }
-        if !dir.pop() {
-            return Err(LayoutError::NoRecipientsFile);
-        }
-    }
+    locate_in(&StoreSelector::Discover, profile)
 }
 
-/// The repo root (dir containing `recipients`), for enumerating profiles.
+/// The store root, for enumerating profiles.
+pub fn store_root(sel: &StoreSelector) -> Result<PathBuf, LayoutError> {
+    resolve_root(sel).map(|(root, _)| root)
+}
+
+/// The store root discovered by walking up from the CWD.
 pub fn repo_root() -> Result<PathBuf, LayoutError> {
-    let mut dir = env::current_dir().map_err(|e| LayoutError::Io(e.to_string()))?;
-    loop {
-        if dir.join(RECIPIENTS_FILE).is_file() {
-            return Ok(dir);
-        }
-        if !dir.pop() {
-            return Err(LayoutError::NoRecipientsFile);
-        }
-    }
+    store_root(&StoreSelector::Discover)
 }
 
-/// List the profile names present in a repo (from `.envstow/*.enc`). Each `<name>.enc` is the
-/// profile `<name>` (so `default.enc` → `default`). Returns a sorted, de-duplicated list.
+/// List the profile names present in a store root (from `<root>/*.enc`). Each `<name>.enc` is
+/// the profile `<name>` (so `default.enc` → `default`). Sorted and de-duplicated.
 pub fn list_profiles(root: &Path) -> Vec<String> {
     let mut names = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root.join(ENVSTOW_DIR)) {
+    if let Ok(entries) = std::fs::read_dir(root) {
         for e in entries.flatten() {
             let fname = e.file_name();
             let fname = fname.to_string_lossy();
@@ -227,11 +544,9 @@ pub fn list_profiles(root: &Path) -> Vec<String> {
     names
 }
 
-/// Path to the identity (private key) file: `$ENVSTOW_IDENTITY` or the per-user config path.
-pub fn identity_path() -> PathBuf {
-    if let Some(p) = env::var_os("ENVSTOW_IDENTITY") {
-        return PathBuf::from(p);
-    }
+/// envstow's per-user config directory: `~/.config/envstow` (`%APPDATA%\envstow` on Windows).
+/// Holds the identity key and, under `stores/`, any central stores.
+pub fn config_dir() -> PathBuf {
     let base = if cfg!(windows) {
         env::var_os("APPDATA").map(PathBuf::from)
     } else {
@@ -239,9 +554,15 @@ pub fn identity_path() -> PathBuf {
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     };
-    base.unwrap_or_else(|| PathBuf::from("."))
-        .join("envstow")
-        .join("identity.txt")
+    base.unwrap_or_else(|| PathBuf::from(".")).join("envstow")
+}
+
+/// Path to the identity (private key) file: `$ENVSTOW_IDENTITY` or the per-user config path.
+pub fn identity_path() -> PathBuf {
+    if let Some(p) = env::var_os("ENVSTOW_IDENTITY") {
+        return PathBuf::from(p);
+    }
+    config_dir().join("identity.txt")
 }
 
 /// Warn (once per invocation, to stderr) if the identity private key is readable by group or
@@ -385,7 +706,7 @@ pub fn read_recipients(path: &Path) -> Result<Vec<Recipient>, LayoutError> {
 /// "update your envstow" rather than a decryption error that reads like a permissions problem.
 pub fn read_store(path: &Path) -> Result<Vec<u8>, LayoutError> {
     if !path.is_file() {
-        return Err(LayoutError::NoStore);
+        return Err(LayoutError::NoStore(path.to_path_buf()));
     }
     let bytes = fs::read(path).map_err(|e| LayoutError::Io(e.to_string()))?;
     let (version, ciphertext) = split_format_header(&bytes)?;
@@ -575,6 +896,123 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pointer_parses_a_name_ignoring_comments_and_blanks() {
+        // The rendered file leads with explanatory comments — parsing must see past them, or
+        // the very file envstow writes wouldn't read back.
+        let text = render_pointer("acme");
+        assert_eq!(parse_pointer(&text).unwrap(), "acme");
+        assert_eq!(parse_pointer("store: acme\n").unwrap(), "acme");
+        assert_eq!(parse_pointer("\n#note\nstore:  acme  \n").unwrap(), "acme");
+    }
+
+    #[test]
+    fn a_pointer_we_cannot_read_is_an_error_not_a_shrug() {
+        // Every one of these must FAIL rather than resolve to "no store here". Falling through
+        // would send the caller to whatever the walk finds next — for the public-repo case,
+        // precisely the store they moved their secrets out of.
+        for bad in [
+            "",                     // empty file
+            "\n\n",                 // only blanks
+            "# just a comment\n",   // no field
+            "acme\n",               // bare name, no `store:` key
+            "store:\n",             // key with no value
+            "store: ../../etc\n",   // path traversal in a name
+            "store: has spaces\n",  // not a valid directory component
+            "gitdir: /somewhere\n", // right shape, wrong tool
+        ] {
+            assert!(
+                matches!(parse_pointer(bad), Err(LayoutError::BadPointer(_))),
+                "should reject pointer {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn store_names_cannot_escape_the_stores_directory() {
+        // A name becomes one directory component under `stores/`. Anything that could climb out
+        // of it, or name a different file, must be refused before it reaches the filesystem.
+        assert!(valid_store_name("acme"));
+        assert!(valid_store_name("my-store_2"));
+        for bad in ["", "..", "a/b", "../etc", "a b", ".hidden", "a.enc"] {
+            assert!(!valid_store_name(bad), "should reject store name {bad:?}");
+        }
+    }
+
+    #[test]
+    fn stores_live_beside_the_identity_not_with_it() {
+        // The separation is deliberate (see STORES_SUBDIR): one directory must not be enough to
+        // both decrypt and hold the ciphertext. If someone "simplifies" this later, this fails.
+        let ident = config_dir().join("identity.txt");
+        let stores = central_stores_dir();
+        assert_ne!(
+            stores,
+            ident.parent().unwrap(),
+            "central stores must NOT sit in the same directory as the identity key"
+        );
+        assert!(
+            stores.starts_with(config_dir()),
+            "but they should still live under the one envstow config dir"
+        );
+    }
+
+    #[test]
+    fn an_explicit_selection_never_falls_back_to_the_walk() {
+        // The safety property of resolve_root: naming a store that isn't there is an error, not
+        // an invitation to go looking. Silently walking could hand back a DIFFERENT store than
+        // the one asked for.
+        let missing = env::temp_dir().join("envstow-definitely-not-a-store");
+        let err = resolve_root(&StoreSelector::Dir(missing.clone())).unwrap_err();
+        assert!(
+            matches!(err, LayoutError::NoStoreAtDir(_)),
+            "a --store-dir with no recipients must fail, got {err:?}"
+        );
+
+        let err = resolve_root(&StoreSelector::Named("nope-not-real-store".into())).unwrap_err();
+        assert!(
+            matches!(err, LayoutError::NoSuchStore { .. }),
+            "an unknown --store must fail, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn store_errors_say_what_to_do_next() {
+        // These messages ARE the feature for anyone who mistypes a store name or clones a repo
+        // whose central store they don't have yet.
+        let dangling = LayoutError::PointerDangling {
+            name: "acme".into(),
+            from: PathBuf::from("/repo/.envstow"),
+            expected: PathBuf::from("/home/u/.config/envstow/stores/acme"),
+        }
+        .to_string();
+        assert!(dangling.contains("acme"), "names the store");
+        assert!(dangling.contains("/repo/.envstow"), "names the pointer");
+        assert!(
+            dangling.contains("envstow init --store acme"),
+            "tells them how to create it: {dangling}"
+        );
+
+        let unknown = LayoutError::NoSuchStore {
+            name: "typo".into(),
+            known: vec!["acme".into(), "side".into()],
+        }
+        .to_string();
+        assert!(
+            unknown.contains("acme, side"),
+            "lists what DOES exist, so a typo is obvious: {unknown}"
+        );
+
+        let bad = LayoutError::BadPointer("no `store:` line found".into()).to_string();
+        assert!(
+            bad.contains("store: <name>"),
+            "shows the expected format: {bad}"
+        );
+        assert!(
+            bad.contains("DIRECTORY") && bad.contains("FILE"),
+            "explains the file-vs-directory distinction: {bad}"
+        );
     }
 
     #[test]
