@@ -107,9 +107,9 @@ walks up to find it. Git is optional — it's just how the folder travels to oth
                                   #   Windows: %APPDATA%\envstow\identity.txt
 ```
 
-The store doesn't have to live in the repo. If you'd rather keep it out — a public repo, or
-collaborators who share a folder instead of a git remote — a **central store** lives in your
-config directory and the repo holds only a pointer to it. See [Stores](#stores).
+The store doesn't have to live in the repo. You can keep it in your config directory or any
+path you like — but nothing in the repo will point at it, so you name it per command. See
+[Stores](#stores).
 
 To *use* a secret you unlock it into a **child process**. The child gets the value in its
 environment and does its job; the value never appears in your shell history, an agent's tool
@@ -226,9 +226,9 @@ holding your public key, and an empty store. Idempotent.
 That's it if you're working **solo** — no git, no sharing, nothing else to do. The folder is the
 scope; `.envstow/` stays local until you decide otherwise.
 
-To keep the store out of the folder entirely — a public repo, or sharing via something other
-than git — `envstow init --store <name>` puts it in `~/.config/envstow/stores/<name>/` and
-leaves only a pointer file here. See [Stores](#stores).
+To keep the store out of the folder entirely, `envstow init --store <name>` puts it in
+`~/.config/envstow/stores/<name>/` and writes nothing here — you reach it with `--store <name>`.
+See [Stores](#stores).
 
 **Optional: one line in your shell rc.** Everything below works with the bare binary — envstow
 prints the exact `eval` line to run whenever your shell needs it. If you'd rather skip even
@@ -451,57 +451,39 @@ env var > `default`. Using a profile that doesn't exist errors and tells you to
 ## Stores
 
 *New in 0.2.0.* By default the store lives in `.envstow/` beside your code and is committed with
-it. Git already handles distribution, history, and "who has the current version," so that's the
-simplest thing that works — and it stays the default. **If it suits you, you can skip this whole
-section.**
+it. Git handles distribution, history, and "who has the current version," which is most of the
+problem — so that's the default, and for a team on a private repo it's usually the right answer.
+**If it suits you, skip this section.**
 
-Two situations where it doesn't:
-
-- **A public repo.** The store is ciphertext, so publishing it isn't a plaintext leak. But it
-  *is* a permanent, world-downloadable copy — decryptable later if a key is ever compromised —
-  and `recipients` publicly lists your collaborators.
-- **No git.** People sharing a folder over Drive/Dropbox/Syncthing. Nothing about envstow ever
-  needed git; only *distribution* assumed it.
-
-### The three kinds of store
-
-| Kind | Where the store lives | How you reach it | Repo gets |
-|---|---|---|---|
-| **Local** (default) | `.envstow/` beside your code | found by walking up from the CWD | the store itself, committed |
-| **Central** | `~/.config/envstow/stores/<name>/` | by **name** — `--store acme` | a small pointer file |
-| **Explicit path** | anywhere — a synced folder, say | by **path** — `--store-dir <path>` | nothing |
-
-### Central stores
+You can also keep the store outside the repo — a folder synced by Drive/Dropbox/Syncthing, a
+path in your config directory, an encrypted volume:
 
 ```bash
-envstow init --store acme
+envstow init --store acme                       # → ~/.config/envstow/stores/acme/
+envstow init --store-dir ~/"Drive/team-secrets"  # → any path you like
 ```
 
-```
-generated identity at ~/.config/envstow/identity.txt
-   your public key: age1zdktfe…
-added you to ~/.config/envstow/stores/acme/recipients
-created empty store at ~/.config/envstow/stores/acme/default.enc
-wrote /my-project/.envstow → central store 'acme' (safe to commit; contains no secrets)
-```
+### Reaching one
 
-No ciphertext and no key material enters the working tree — only the pointer, which exists so
-ordinary commands need no flag:
+An external store is **never** referenced from inside the repo. You name it per command, or
+export it for the shell:
 
 ```bash
-envstow set API_KEY        # resolves through the pointer — no --store needed
-envstow list
-envstow run -- ./deploy
+envstow --store acme list                  # by name (config dir)
+envstow --store-dir ~/"Drive/team-secrets" list   # by path
+export ENVSTOW_STORE=acme                  # …or make it sticky for this shell
+export ENVSTOW_STORE_DIR=~/"Drive/team-secrets"
+envstow store                              # which store is in effect, and why
 ```
 
-Layout:
+Layout for a named store:
 
 ```
 ~/.config/envstow/
   identity.txt          # your private key — deliberately NOT inside stores/
   stores/
     acme/
-      recipients        # THIS store's collaborators (not shared with other stores)
+      recipients        # THIS store's collaborators (its own, not shared with other stores)
       default.enc
       prod.enc          # profiles live inside a store: --store acme --profile prod
 ```
@@ -510,192 +492,107 @@ The identity sits *beside* `stores/` on purpose: together, one directory would b
 decrypt everything in it — which an over-broad backup or a synced config folder would carry
 whole.
 
-The pointer holds a **name, not a path**, which is what makes it portable: it resolves under
-each person's own home directory, so it survives differing layouts and leaks nothing beyond the
-fact that envstow is in use.
+### Nothing in the repo can point at one
 
-```
-store: acme
-```
+This is deliberate, and it's the one design decision here worth knowing.
 
-### Sharing a central store
+An earlier version let a repo commit a `.envstow` *file* containing `store: acme`, so commands
+in that project needed no flag. Convenient — and it made "where do this project's secrets come
+from" something **one person could change for everyone**, silently, on the next `git pull`.
 
-**This is the part git was doing for you.** A committed store travels with the repo; a central
-store doesn't. The pointer names a store — nothing transports it.
+The dangerous direction is external → committed. Someone hits friction with the external store,
+creates a local `.envstow/`, and commits it. Everyone else pulls, and the walk finds that
+perfectly plausible local store. Same command, same directory, *different secret*, no error —
+and if you're a recipient of both stores (which you are the moment you've ever run `init`
+there), you just deploy the wrong credential.
 
-So `init --store acme` in a repo already pointing at `acme`, on a machine without it, is a
-**join**, not a create. envstow refuses rather than make a second empty store with the same name:
+Making the redirect impossible removes the failure rather than detecting it afterward. The cost
+is real: reaching an external store means a flag or an exported variable every time, and
+forgetting falls back to the walk. But that mistake is *yours*, in *your* shell, and it's
+recoverable — the other one silently changed everybody's secrets.
 
-```
-envstow: this project already points at the central store 'acme', but you don't have it yet.
-   Creating it here would make a SECOND, empty store with the same name — not a copy
-   of your colleague's — and nothing would warn you they'd diverged.
+The corollary: **if a team shares an external store, they have to agree how.** Who has it, how
+a new person gets a copy, what happens when someone adds a secret. envstow won't arrange it, and
+no file in the repo will either. If that sounds like work, that's the honest signal to commit
+the store instead and let git do it.
 
-   To join, send them your public key:
-     age1kk8x4…
-```
+### Sharing one
 
-The join, from a fresh clone:
+Nothing transports an external store — you send it yourself.
 
 ```bash
 # Them:
 envstow pubkey                              # → age1kk8x4…  send it over
-                                            #   (`envstow init` first if they have no key yet)
 # You:
-envstow add-recipient age1kk8x4… bob        # adds + re-encrypts
-envstow store                               # find your store dir; send them that directory
+envstow --store acme add-recipient age1kk8x4… bob   # adds + re-encrypts
+envstow --store acme store                  # shows the directory; send them that
 # Them: drop it at ~/.config/envstow/stores/acme/, then
-envstow list                                # your secrets
+envstow --store acme list
 ```
 
-If sharing is the main thing you need, a **shared folder** (below) is less work — it makes
-transport somebody else's problem.
-
-### An explicit path
-
-For a store that's neither in the repo nor in your config dir — a folder synced by
-Drive/Dropbox/Syncthing, an encrypted volume, a mounted path in CI:
-
-```bash
-envstow init --store-dir ~/"Google Drive/team-secrets"
-envstow --store-dir ~/"Google Drive/team-secrets" set API_KEY
-export ENVSTOW_STORE_DIR=~/"Google Drive/team-secrets"   # …or make it sticky
-```
-
-No pointer file is written here, deliberately: a path is machine-specific, so committing one
-would break for everyone whose layout differs. Reach it with the flag or the env var.
-
-For a synced folder, each collaborator just points at their own synced copy — the sync service
-handles distribution, which is the part central stores make you do by hand.
-
-### Which store am I using?
-
-With several ways to select one, *"am I about to write this secret where I think?"* shouldn't
-need guessing:
-
-```bash
-envstow store
-```
-
-```
-current store: ~/.config/envstow/stores/acme (central store 'acme', via /my-project/.envstow)
-profiles: default, prod
-
-central stores: acme, side
-```
-
-`unlock`, `run`, and `env` also name the store in their banner whenever it isn't a plain local
-`.envstow/` — for which your working directory already says it, and saying more would be noise:
-
-```
-envstow: loaded 1 secret(s) from default (central store 'acme', via /my-project/.envstow): API_KEY
-```
+A **synced folder** with `--store-dir` avoids most of this: everyone points at their own synced
+copy and the sync service does the transport.
 
 ### Selection precedence
 
 ```
 --store-dir <path>        explicit path
---store <name>            central store, by name
+--store <name>            a store in your config dir, by name
 $ENVSTOW_STORE_DIR
 $ENVSTOW_STORE
-a `.envstow` found by walking up:
-    directory  →  local store (the original behavior)
-    file       →  pointer → central store
-otherwise                 error, listing the central stores that exist
+.envstow/ found by walking up from the CWD    (the default)
+otherwise                 error, listing the stores you have
 ```
 
-Flags work before or after the subcommand (`envstow --store acme list` and
-`envstow list --store acme` are the same), and compose with `--profile`. Passing both `--store`
-and `--store-dir` is refused rather than resolved — that combination means you're unsure which
-store you're touching.
+Flags work before or after the subcommand and compose with `--profile`. Passing both `--store`
+and `--store-dir` is refused rather than resolved. Naming a store that doesn't exist is always
+an error listing the ones that do — it never quietly falls back to the walk.
 
-**A missing store is always an error, never a fallback.** Naming one that isn't there fails and
-lists the ones that are; it never quietly walks up the tree instead. That matters most for the
-case this feature exists for: silently falling back could hand a public-repo user the local
-store they moved their secrets *out of*.
+### Upgrading from a repo with a `.envstow` file
 
-```
-$ envstow --store acmee list
-envstow: no central store named 'acmee'.
-   Known stores: acme
-```
+If a project still carries a committed pointer file from the earlier scheme, envstow refuses it
+and explains the options rather than following it — skipping it would be the same silent
+substitution described above:
 
 ```
-$ envstow list          # a cloned repo whose central store you don't have yet
-envstow: /my-project/.envstow points at the central store 'acme', which isn't on this machine.
-   Expected it at: ~/.config/envstow/stores/acme
-   Create it with `envstow init --store acme`, or get a copy from whoever shares it with you.
-```
+$ envstow list
+envstow: /my-project/.envstow is a FILE saying this project's secrets live in the external store 'acme'.
+  envstow no longer follows these — a committed file that redirects where secrets
+  come from silently changes them for everyone on the next pull.
 
-### `.envstow` is a file *or* a directory
-
-A **directory** holds a local store; a **file** points at a central one. Same name, and the
-filesystem type tells them apart — the same trick git uses, where `.git` is a file containing
-`gitdir:` inside a worktree.
-
-One name to learn, and a repo has one or the other, never both — so "which store wins?" can't
-arise. See [DESIGN.md](DESIGN.md#where-the-store-lives) for the full reasoning.
-
-**Running `init` in a repo that already carries a pointer** — the natural reflex after cloning —
-refuses rather than clobber it, since the pointer may name the only copy of someone's secrets.
-
-The same situation has three legitimate resolutions and envstow can't tell which you meant, so
-rather than state the problem and stop, it lists them with the likeliest first:
-
-```
-$ envstow init
-envstow: /my-project/.envstow is a FILE, so it points at a store kept elsewhere —
-  it isn't a local store directory, and there's nothing here to initialize.
-
-   If you're trying to JOIN this project's secrets (most likely — you cloned it):
-     envstow init --store acme
-   If you're trying to START A SEPARATE store, unrelated to 'acme':
-     envstow init --store <another-name>
-   If you're trying to KEEP SECRETS IN THIS REPO instead — delete the pointer file,
-   then re-run (this repo stops using 'acme'):
+   If you HAVE that store, name it per command (nothing to commit):
+     envstow --store <name> <command>     …or export ENVSTOW_STORE=<name>
+     envstow store                        …lists the stores you have
+   If you DON'T have it, ask whoever set this up to share it — and agree with
+   them how you'll keep it in sync, since git won't do it for you.
+   If this project's secrets should live IN THE REPO (simplest for a team):
      rm /my-project/.envstow && envstow init
 ```
 
-Once you *have* the store, the first branch becomes `envstow set <NAME>` instead — there's
-genuinely nothing left to initialize. The dangling-pointer error (which any command hits, not
-just `init`) is laid out the same way.
-
-### Moving an existing store
-
-There's no `migrate` command; the files are just files.
+To move an external store into the repo (no `migrate` command needed — they're just files):
 
 ```bash
-# local → central
-mv .envstow ~/.config/envstow/stores/acme
-printf 'store: acme\n' > .envstow
-git add .envstow && git commit -m "Move secrets to a central store"
+rm .envstow                                     # drop the old pointer
+cp -R ~/.config/envstow/stores/acme .envstow    # bring the store in
+git add .envstow && git commit -m "Keep secrets in the repo"
 ```
 
-For a **public repo**, moving the files is only half of it — the ciphertext stays in git history
-for anyone who ever cloned. Treat every secret in it as exposed and **rotate at the source**.
-That's the same reasoning `remove-recipient` prints: history is forever, so rotation is the only
-real revocation.
+For a **public** repo, moving files is only half of it: any ciphertext already pushed stays in
+git history. Treat those secrets as exposed and **rotate at the source** — the same reasoning
+`remove-recipient` prints.
 
 ### What git was quietly providing
 
-Two things a non-git store loses. Neither is fatal, but both are worth knowing before you rely
-on one:
+Two things an external store loses:
 
 - **Concurrent writes can clobber.** Two people running `envstow set` against the same shared
   folder produces a last-writer-wins overwrite or a sync-conflict copy. Git would have refused
-  the push and made you pull. **envstow does not guard this** — coordinate writes, or use git.
+  the push. **envstow does not guard this** — coordinate writes, or use git.
 - **No history.** A bad `reencrypt` or an accidental `delete` is recoverable from git; from a
-  shared folder, only via whatever version history your sync service keeps.
+  shared folder, only via your sync service's own version history.
 
-Error messages adapt to this: advice like `git pull && envstow reencrypt && git add .envstow`
-only appears when the store actually is in a git work tree.
-
-### Compatibility
-
-Central stores and pointer files need **≥ 0.2.0** on every machine that works in the repo — see
-[Store format & version mismatches](#store-format--version-mismatches) for what an older binary
-does when it meets a pointer file. Local `.envstow/` directories are unaffected and need no
-upgrade.
+Error messages adapt: advice like `git pull && envstow reencrypt && git add .envstow` only
+appears when the store actually is in a git work tree.
 
 ---
 
@@ -703,7 +600,7 @@ upgrade.
 
 | Command | Purpose |
 |---|---|
-| `envstow init [--store <name>\|--store-dir <path>]` | Generate identity, create `recipients` + empty store. Default: in this folder. With `--store`, centrally, leaving only a pointer here. Idempotent. |
+| `envstow init [--store <name>\|--store-dir <path>]` | Generate identity, create `recipients` + empty store. Default: in this folder. With `--store`/`--store-dir`, outside it — nothing is written here. Idempotent. |
 | `envstow store` | Show which store is in effect **and why**; list central stores. |
 | `envstow set <NAME> [--clipboard]` | Store a value read from **stdin**, or the OS clipboard with `--clipboard` (`-c`). Never in argv either way. |
 | `envstow delete <NAME> [--force]` | Remove one secret; re-encrypt (then **rotate**). Confirms on a TTY. |
@@ -891,18 +788,12 @@ store that 0.1.9 has written reports `decryption failed: Header is invalid`. Eve
 store needs to be on ≥ 0.1.9 — no re-init or migration beyond that. Stores made by older
 versions are read fine and are upgraded in place the first time anything writes them.
 
-**Pointer files need ≥ 0.2.0.** Central stores (and the `.envstow` *file* that points at one)
-arrived in 0.2.0. This is a change to what `.envstow` **is**, not to the store format, so the
-format guard above can't catch it: a `≤ 0.1.x` binary looks for `.envstow/recipients`, doesn't
-find it inside a file, and walks past — reporting
+**External stores need ≥ 0.2.0** on any machine that uses one — `--store` / `--store-dir` and
+their env vars don't exist in `0.1.x`. Nothing about this affects the store *format*, and a
+local `.envstow/` directory reads and writes identically on both.
 
-```
-envstow: no `.envstow/recipients` file found in this directory or any parent (run `envstow init` first)
-```
-
-as though the repo didn't use envstow at all. Everyone working in a repo with a pointer file
-needs ≥ 0.2.0. Local `.envstow/` **directories** are unaffected in both directions and need no
-upgrade.
+A `.envstow` **file** (the committed redirect that 0.2.0 briefly supported) is refused from
+0.2.2 on; see [Upgrading from a repo with a `.envstow` file](#upgrading-from-a-repo-with-a-envstow-file).
 
 ---
 

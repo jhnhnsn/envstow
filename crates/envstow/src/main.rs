@@ -32,7 +32,7 @@
 
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use zeroize::Zeroize;
@@ -551,125 +551,35 @@ fn cmd_init(args: &[String]) -> Cmd {
         layout::StoreSelector::Dir(path) => path.clone(),
         layout::StoreSelector::Discover => cwd.join(layout::ENVSTOW_DIR),
     };
-    // A local store must not collide with a pointer file of the same name — `.envstow` is one
-    // or the other. Refuse rather than clobber: the pointer names a store that may hold the
-    // only copy of someone's secrets.
-    //
-    // Which advice to give depends on whether the named store is actually on this machine, and
-    // the difference matters: a fresh clone carries the pointer but NOT the store, so telling
-    // that user to "add secrets with `envstow set`" sends them into an immediate second error.
-    // That's the common case — someone who just cloned and reflexively ran `init`.
+    // `.envstow` here is a FILE — a leftover redirect from the removed pointer scheme. Refuse
+    // rather than replace it: it names a store that may hold the only copy of someone's secrets,
+    // and whoever set it up needs to hear about it before this repo starts using a different one.
     if matches!(sel, layout::StoreSelector::Discover) && store_root.is_file() {
         let named = std::fs::read_to_string(&store_root)
             .ok()
             .and_then(|t| layout::parse_pointer_name(&t));
-        // `init` here could mean any of three different things, and the file alone doesn't say
-        // which. Rather than guess and be wrong for two of them, name each intent and give it
-        // its command — the reader picks the line that matches what they were trying to do.
-        let goals = match &named {
-            Some(n)
-                if layout::central_store_path(n)
-                    .join(layout::RECIPIENTS_NAME)
-                    .is_file() =>
-            {
-                format!(
-                    "\x20  If you're trying to ADD A SECRET — you're already set up, nothing to \
-                     initialize:\n\
-                     \x20    envstow set <NAME>\n\
-                     \x20  If you're trying to SEE WHERE SECRETS LIVE:\n\
-                     \x20    envstow store\n\
-                     \x20  If you're trying to KEEP SECRETS IN THIS REPO instead of the '{n}' \
-                     store — delete\n\
-                     \x20  the pointer file, then re-run (this repo stops using '{n}'):\n\
-                     \x20    rm {} && envstow init",
-                    store_root.display()
-                )
-            }
-            Some(n) => format!(
-                "\x20  If you're trying to JOIN this project's secrets (most likely — you \
-                 cloned it):\n\
-                 \x20    envstow init --store {n}\n\
-                 \x20  If you're trying to START A SEPARATE store, unrelated to '{n}':\n\
-                 \x20    envstow init --store <another-name>\n\
-                 \x20  If you're trying to KEEP SECRETS IN THIS REPO instead — delete the \
-                 pointer file,\n\
-                 \x20  then re-run (this repo stops using '{n}'):\n\
-                 \x20    rm {} && envstow init",
-                store_root.display()
-            ),
-            // Unreadable pointer: don't guess a store name — it may be a typo in a file someone
-            // committed, and inventing one would send them to the wrong store.
-            None => format!(
-                "\x20  The file is unreadable as a pointer, so envstow can't tell which store \
-                 it meant.\n\
-                 \x20  If you're trying to FIX IT — a pointer is one line, `store: <name>`:\n\
-                 \x20    envstow store          (shows what envstow makes of it)\n\
-                 \x20  If you're trying to KEEP SECRETS IN THIS REPO — replace it with a store:\n\
-                 \x20    rm {} && envstow init",
-                store_root.display()
-            ),
+        let store = match &named {
+            Some(n) => format!("the external store '{n}'"),
+            None => "an external store".to_string(),
         };
-        // The header states only what's true in every branch: `.envstow` here is a FILE, and a
-        // file is a pointer to a store elsewhere — never a store itself. Whether it names a
-        // readable one is the branches' business.
         return Err(AppError::msg(format!(
-            "{} is a FILE, so it points at a store kept elsewhere —\n\
-             \x20 it isn't a local store directory, and there's nothing here to initialize.\n\
+            "{0} is a FILE saying this project's secrets live in {store}.\n\
+             \x20 envstow no longer follows these — a committed file that redirects where \
+             secrets come\n\
+             \x20 from silently changes them for everyone on the next pull.\n\
              \n\
-             {goals}",
+             \x20  If you HAVE that store, name it per command (nothing to commit):\n\
+             \x20    envstow --store <name> <command>     …or export ENVSTOW_STORE=<name>\n\
+             \x20    envstow store                        …lists the stores you have\n\
+             \x20  If you DON'T have it, ask whoever set this up to share it — and agree with \
+             them\n\
+             \x20  how you'll keep it in sync, since git won't do it for you.\n\
+             \x20  If this project's secrets should live IN THE REPO (simplest for a team):\n\
+             \x20    rm {0} && envstow init",
             store_root.display()
         )));
     }
 
-    // `init --store <name>` in a repo that ALREADY points at that store, on a machine that
-    // doesn't have it: this is someone joining a colleague's project, not starting a new one.
-    //
-    // The local flow catches the equivalent case for free — a git clone brings the store and its
-    // `recipients` along, so `init` sees other people's keys and reports "you're joining." A
-    // central store isn't cloned, so there is nothing on disk to notice, and the naive path
-    // cheerfully creates a SECOND empty store with the same name. Two stores, no sync, no
-    // warning: the user thinks they joined and has actually diverged.
-    //
-    // The pointer is the one piece of evidence that someone else's store exists. Trust it and
-    // stop, rather than manufacture a decoy.
-    if let layout::StoreSelector::Named(name) = &sel {
-        let pointer = cwd.join(layout::ENVSTOW_DIR);
-        let points_here = pointer
-            .is_file()
-            .then(|| std::fs::read_to_string(&pointer).ok())
-            .flatten()
-            .and_then(|t| layout::parse_pointer_name(&t))
-            .is_some_and(|n| &n == name);
-        if points_here && !store_root.join(layout::RECIPIENTS_NAME).is_file() {
-            return Err(AppError::msg(format!(
-                "this project already points at the central store '{name}', but you don't have \
-                 it yet.\n\
-                 \x20 Creating it here would make a SECOND, empty store with the same name — \
-                 not a copy of\n\
-                 \x20 your colleague's — and nothing would warn you they'd diverged.\n\
-                 \n\
-                 \x20  If you're trying to JOIN '{name}' (most likely), three steps:\n\
-                 \x20    1. Send whoever has it your public key:\n\
-                 \x20         {public}\n\
-                 \x20    2. They run:  envstow add-recipient {public} <your-name>\n\
-                 \x20    3. They send you their store directory (`envstow store` shows them \
-                 where it is);\n\
-                 \x20       you put it at:\n\
-                 \x20         {}\n\
-                 \x20    Then `envstow list` works here.\n\
-                 \n\
-                 \x20  If you're trying to START A SEPARATE store that just happens to share \
-                 the name:\n\
-                 \x20    envstow init --store <another-name>\n\
-                 \x20  If you're trying to KEEP SECRETS IN THIS REPO instead — delete the \
-                 pointer file,\n\
-                 \x20  then re-run (this repo stops using '{name}'):\n\
-                 \x20    rm {} && envstow init",
-                store_root.display(),
-                pointer.display()
-            )));
-        }
-    }
     if let Err(e) = std::fs::create_dir_all(&store_root) {
         return Err(AppError::msg(format!(
             "could not create {}: {e}",
@@ -732,46 +642,11 @@ fn cmd_init(args: &[String]) -> Cmd {
         }
     }
 
-    // 4. For a central store, leave a pointer in the CWD so this project resolves to it with no
-    //    flag and no exported variable. Without it, every command here would need `--store`, and
-    //    forgetting would fall through to the walk — which for a public repo means quietly
-    //    finding some OTHER store, the exact outcome this setup exists to prevent.
-    // Set when we created a store but this directory still points somewhere else — the store
-    // exists and is fine, but commands run *here* won't reach it. Reported at the end instead of
-    // the usual "Ready", which would be false.
-    let mut pointer_conflict: Option<(String, PathBuf)> = None;
-    if let layout::StoreSelector::Named(name) = &sel {
-        let pointer = cwd.join(layout::ENVSTOW_DIR);
-        if pointer.is_dir() {
-            eprintln!(
-                "⚠️  {} is a local store directory, so no pointer was written here.\n\
-                 \x20   Commands in this directory will use that local store, not '{name}'.",
-                pointer.display()
-            );
-        } else if pointer.is_file() {
-            // A pointer naming a DIFFERENT store is the case that bites: we just built '{name}',
-            // but this directory still resolves to whatever the pointer says, so every command
-            // here keeps failing (or worse, silently uses the other store). Saying "pointer
-            // already exists" and then "Ready" would be two lies in a row.
-            let existing = std::fs::read_to_string(&pointer)
-                .ok()
-                .and_then(|t| layout::parse_pointer_name(&t));
-            match existing {
-                Some(other) if &other != name => {
-                    pointer_conflict = Some((other, pointer.clone()));
-                }
-                _ => eprintln!("pointer already exists at {}", pointer.display()),
-            }
-        } else if let Err(e) = std::fs::write(&pointer, layout::render_pointer(name)) {
-            return Err(AppError::msg(format!("could not write pointer file: {e}")));
-        } else {
-            eprintln!(
-                "wrote {} → central store '{name}' (safe to commit; contains no secrets)",
-                pointer.display()
-            );
-        }
-    }
-
+    // 4. Nothing is written into the repo for an external store — that's the point. A committed
+    //    file naming the store would make "where do this project's secrets come from" a thing
+    //    one person can change for everyone, silently, on the next pull. Reaching an external
+    //    store is a per-machine choice: `--store` / `--store-dir`, or the env vars.
+    //
     // 5. Offer to add the Claude Code agent skill to THIS repo (so it commits + travels to
     //    teammates). Prompts [Y/n]; --no-skill skips; non-interactive defaults to yes.
     if !skip_skill {
@@ -782,27 +657,7 @@ fn cmd_init(args: &[String]) -> Cmd {
     // whose store belongs to other people is NOT ready — they're waiting on a recipient. Saying
     // otherwise (right after two green checkmarks) is what makes the later "No matching keys"
     // look like a bug rather than the expected next step.
-    if let Some((other, pointer)) = &pointer_conflict {
-        let created = match &sel {
-            layout::StoreSelector::Named(n) => n.clone(),
-            _ => layout::DEFAULT_PROFILE.to_string(),
-        };
-        eprintln!(
-            "\n⚠️  The store '{created}' is ready, but THIS directory still points at '{other}'\n\
-             \x20  ({}), so commands run here won't reach '{created}'.\n\
-             \n\
-             \x20  If you're trying to USE '{created}' HERE — repoint this project at it:\n\
-             \x20    printf 'store: {created}\\n' > {}\n\
-             \x20  If you're trying to USE '{created}' SOMEWHERE ELSE — nothing more to do here; \
-             run\n\
-             \x20  `envstow init --store {created}` in that project, or use \
-             `--store {created}` per command.\n\
-             \x20  If you meant to get '{other}' working instead:\n\
-             \x20    envstow init --store {other}",
-            pointer.display(),
-            pointer.display()
-        );
-    } else if joining_existing {
+    if joining_existing {
         eprintln!(
             "\n⏳ Almost there — you can't decrypt this store yet. Send your public key to \
              someone\n\
@@ -814,6 +669,23 @@ fn cmd_init(args: &[String]) -> Cmd {
     } else {
         eprintln!("\nReady. Add secrets by editing the store, then `envstow unlock`.");
         eprintln!("   Share your public key with collaborators so they can add you.");
+        // An external store leaves NOTHING in the working directory, so the walk will never find
+        // it — say how to reach it, or the next command fails with "no store found" and no clue.
+        match &sel {
+            layout::StoreSelector::Named(n) => eprintln!(
+                "\n   This store is outside the repo, so nothing here points at it. Reach it \
+                 with:\n\
+                 \x20    envstow --store {n} <command>       (or export ENVSTOW_STORE={n})"
+            ),
+            layout::StoreSelector::Dir(p) => eprintln!(
+                "\n   This store is outside the repo, so nothing here points at it. Reach it \
+                 with:\n\
+                 \x20    envstow --store-dir {0} <command>\n\
+                 \x20    (or export ENVSTOW_STORE_DIR={0})",
+                p.display()
+            ),
+            layout::StoreSelector::Discover => {}
+        }
     }
     Ok(())
 }
@@ -1132,14 +1004,12 @@ fn print_help() {
          (e.g. dev/staging/prod), or set $ENVSTOW_PROFILE. Default is `default`.\n\
          \n\
          Stores: by default your secrets live in `.envstow/` beside your code, committed with\n\
-         it. To keep them OUT of the repo (a public repo, or sharing via a synced folder rather\n\
-         than git), use a central store instead:\n\
-         \x20 envstow init --store <name>      Store lives in ~/.config/envstow/stores/<name>/;\n\
-         \x20                                  a `.envstow` pointer file (no secrets) is written\n\
-         \x20                                  here so commands in this repo need no flag.\n\
-         \x20 envstow init --store-dir <path>  Store lives at any path (e.g. a shared folder).\n\
-         Select one explicitly with `--store <name>` / `--store-dir <path>`, or $ENVSTOW_STORE /\n\
-         $ENVSTOW_STORE_DIR. `envstow store` says which one is in effect.\n\
+         it. A store can instead live outside the repo:\n\
+         \x20 envstow init --store <name>      In ~/.config/envstow/stores/<name>/\n\
+         \x20 envstow init --store-dir <path>  At any path (e.g. a shared folder).\n\
+         Nothing is written into the repo for these — nothing committed can change which store a\n\
+         project uses — so reach them with `--store <name>` / `--store-dir <path>`, or\n\
+         $ENVSTOW_STORE / $ENVSTOW_STORE_DIR. `envstow store` says which one is in effect.\n\
          \n\
          EXAMPLES:\n\
          \x20 envstow set MY_TOKEN --clipboard         # store a secret straight from the clipboard\n\

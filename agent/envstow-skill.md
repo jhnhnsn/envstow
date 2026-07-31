@@ -10,15 +10,17 @@ self-contained binary — no `sops`/`age` CLIs needed. Secrets are used **by nam
 plaintext must never enter your output, a tool-call argument, or a file.
 
 **Does this repo use envstow?** It does if `envstow list` succeeds — that's the reliable check.
-There are two layouts, and you don't need to care which is in play:
-- a `.envstow/` **directory** holding the store, committed with the repo; or
-- a `.envstow` **file** containing `store: <name>`, pointing at a store outside the repo (used
-  when the store shouldn't be committed, e.g. a public repo). `envstow store` shows which.
+The store is normally `.envstow/` in the repo, but it can live outside it, in which case commands
+need `--store <name>` or `--store-dir <path>` (or `$ENVSTOW_STORE` / `$ENVSTOW_STORE_DIR`).
+`envstow store` reports which is in effect.
 
 If `envstow list` fails, this skill doesn't apply — the repo may use a plain `.env` or another
-secrets tool. One exception: if it reports a **dangling pointer** (a `.envstow` file naming a
-store that isn't on this machine), envstow *is* in use and the human needs to create or obtain
-that store. Tell them; don't try to work around it.
+secrets tool. Two exceptions worth recognizing rather than working around:
+- **A `.envstow` FILE** (not a directory) means this project once used an external store via a
+  committed redirect, which envstow no longer follows. The human has to decide how to proceed —
+  tell them what the error says; don't delete the file or run `init`.
+- **"no store found" while the human expects one** may just mean an external store needs naming.
+  Ask which store, then use `--store`; don't create one.
 
 ## The one rule
 

@@ -6,8 +6,9 @@ name** so their plaintext never has to be pasted onto a command line. All crypto
 crate compiled into the `envstow` binary — there are no external tools (`sops`/`age` CLIs) to
 install or invoke.
 
-(A store can also live outside the repo — `~/.config/envstow/stores/<name>/` via a committed
-`.envstow` pointer file, or any path via `--store-dir`. This repo uses the committed
+(A store can also live outside the repo — `~/.config/envstow/stores/<name>/` via `--store
+<name>`, or any path via `--store-dir <path>`. Nothing committed can select one, so those need
+the flag or `$ENVSTOW_STORE` / `$ENVSTOW_STORE_DIR` every time. This repo uses the committed
 `.envstow/` directory; `envstow store` reports which is in effect. Everything below applies
 identically either way.)
 

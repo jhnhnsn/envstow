@@ -2,34 +2,37 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
-## Unreleased
+## 0.2.2
 
-### Fixed
-- **`envstow init` in a repo carrying a pointer file now gives advice that works.** It correctly
-  refused to clobber the pointer, but always suggested "add secrets with `envstow set`" — which
-  fails immediately when the named store isn't on this machine. That's the *likeliest* way to
-  meet this error: clone a repo with a committed pointer, reflexively run `init`, and get sent
-  into a second failure with no mention of the command that actually helps. The message now
-  splits on whether the store is present: `envstow set` when it is, `envstow init --store <name>`
-  to join when it isn't, and a plain "that file isn't a readable pointer" when it can't be
-  parsed. All three still name the escape hatch (delete the pointer for a local store).
+### Removed
+- **A committed `.envstow` file can no longer redirect a project to an external store.** 0.2.0
+  introduced these pointer files so a repo using an external store needed no flag. They're gone,
+  and existing ones are refused with migration advice rather than followed.
 
-- **`init --store <name>` no longer reports "Ready" when this directory points somewhere else.**
-  Creating a store beside a pointer naming a *different* one printed a bland "pointer already
-  exists" and then declared success — but the directory still resolved to the other store, so
-  every following command failed. Worse, that was the exact outcome of following the "start a
-  separate store" advice: do as told, get told it worked, find nothing works. It now names the
-  store that's actually in effect and gives the one-line command to repoint the project — and
-  still never rewrites the pointer itself, since which store a project uses is the user's call.
+  The reason is what they made possible: *where a project's secrets come from* became something
+  one person could change and everyone else inherited on the next `git pull` — **silently**, in
+  the dangerous direction. Someone hits friction with the external store, creates a local
+  `.envstow/`, commits it; everyone else pulls and the walk finds that perfectly plausible local
+  store. Same command, same directory, **different secret**, no error. Anyone who is a recipient
+  of both stores (which you are the moment you've ever run `init` there) simply gets the wrong
+  value — and deploys it. Detecting the switch afterward needs per-project state and fires on
+  legitimate migrations too; making the redirect unrepresentable removes the failure class.
+
+  External stores still work, via `--store <name>` / `--store-dir <path>` and their env vars —
+  a per-machine choice, never inherited from a checkout. The cost is a flag or an exported
+  variable every time, and forgetting falls back to the walk; that mistake is one person's, in
+  their own shell, and recoverable. The corollary is deliberate: **a team sharing an external
+  store has to agree how**, because no file in the repo will arrange it for them. If that's
+  tedious, commit the store and let git do the work.
+
+  `envstow init --store <name>` now writes nothing into the working directory and tells you how
+  to reach the store it made. Everything the pointer scheme needed — the fork guard, the
+  file-or-directory rule, the intent-routing for pointer collisions — is gone with it.
 
 ### Changed
-- **Store errors route by intent rather than stating a fact and stopping.** Each now lists the
-  things you might have been trying to do and the command for each — "If you're trying to JOIN
-  this project's secrets… / to START A SEPARATE store… / to KEEP SECRETS IN THIS REPO instead…"
-  — with the likeliest first. A bare statement of what's wrong reads as a dead end when the same
-  situation has three legitimate resolutions and the tool can't tell which you meant. Applies to
-  the pointer-collision error, the fork guard, and the dangling-pointer error (the one a new
-  collaborator meets first, from any command).
+- **`init --store` / `--store-dir` now say how to reach the store they made.** With nothing
+  written into the working directory, the walk will never find it — so the closing line names the
+  flag (or env var) instead of leaving the next command to fail with "no store found".
 
 ## 0.2.1
 

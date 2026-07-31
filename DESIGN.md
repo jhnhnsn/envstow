@@ -57,53 +57,44 @@ It is not, however, always possible or wise:
 
 So a store root is resolved from one of two kinds:
 
-| Kind | Root | Addressed by |
-|---|---|---|
-| **Local** | `.envstow/` beside your code, found by walking up from the CWD | position |
-| **Central** | `~/.config/envstow/stores/<name>/` | name |
+| Kind | Root | Addressed by | Selected by |
+|---|---|---|---|
+| **In the repo** | `.envstow/` beside your code | position (walk up from the CWD) | the default |
+| **Outside it** | `~/.config/envstow/stores/<name>/`, or any path | name, or path | `--store` / `--store-dir`, or their env vars — **never** anything committed |
 
-Plus `--store-dir <path>` for a root that is neither — a synced folder, say.
+### Nothing committed may point outside the repo
 
-### `.envstow` is a file *or* a directory
+An earlier cut of this let a repo commit a `.envstow` **file** containing `store: <name>` — a
+redirect saying *this project's secrets live elsewhere*, so commands in that project needed no
+flag. It borrowed the trick git uses for worktrees, where `.git` is a file holding `gitdir:`.
 
-A repo using a central store must be able to *say so*, or every command in it needs a flag.
-It does that with a `.envstow` **file** containing `store: <name>`, where a local store has a
-`.envstow` **directory**. Same name; the filesystem type discriminates.
+It was removed, because of what it makes possible rather than what it does.
 
-This is exactly git's own trick: in a worktree or submodule, `.git` is a file containing
-`gitdir: <path>` rather than a directory. Borrowing it buys two things:
+A committed redirect makes *where a project's secrets come from* a thing one person can change
+and everyone else inherits on the next `git pull`. The external → committed direction is the
+dangerous one, and it is **silent**: someone hits friction with the external store, creates a
+local `.envstow/`, commits it; everyone else pulls and the walk finds that perfectly plausible
+local store. Same command, same directory, different secret, no error. Anyone who is a recipient
+of both stores — which happens the moment they have ever run `init` in that repo — simply gets
+the wrong value. (The reverse, committed → external, fails loudly, because a missing store is
+unmissable.)
 
-1. **One name to learn.** "Your store is `.envstow`" — sometimes a directory, sometimes a
-   pointer to one.
-2. **The ambiguity is unrepresentable.** The alternative — a pointer at `.envstow/store`,
-   *inside* the store directory — would need a rule for "what if a repo has both?", and any
-   rule that silently picks a winner picks the wrong store some of the time. A path is a file
-   or a directory, never both, so the question cannot arise.
+Detecting the switch after the fact was the obvious fix and the wrong one: it needs per-project
+state envstow doesn't otherwise keep, and it fires on legitimate migrations too, so it decays
+into a warning people dismiss. Making the redirect **unrepresentable** removes the failure class
+instead.
 
-The pointer holds a **name, not a path**. That is what makes it safe to commit: it resolves
-under each collaborator's own home directory, works across machines with different layouts, and
-leaks nothing beyond the fact that envstow is in use.
+The cost is real and worth stating: reaching an external store now takes a flag or an exported
+variable every time, and forgetting one falls back to the walk. But that mistake is one person's,
+in their own shell, and recoverable — where the other silently changed everybody's secrets.
 
-### Resolution order
+The corollary is a deliberate non-feature: **if a team shares an external store, they must agree
+how.** Who has it, how a new person gets a copy, what happens when someone adds a secret. envstow
+will not arrange it and no file in the repo will either. A team that finds that tedious is being
+told something true — commit the store and let git do the work.
 
-```
---store-dir <path>       explicit path      no walk
---store <name>           central store      no walk
-$ENVSTOW_STORE_DIR / $ENVSTOW_STORE
-walk up for `.envstow`:
-    directory  →  local store (the original behavior, unchanged)
-    file       →  read `store: <name>`  →  central store
-otherwise                error, listing the central stores that do exist
-```
-
-Nearest wins during the walk, so a nested project overrides an outer one — matching both the
-previous behavior and how git resolves `.git`.
-
-**An explicit selection never falls back to the walk.** Naming a store that isn't there is an
-error, not an invitation to go looking. This matters most for the case the feature exists for:
-if `--store` quietly fell through, a public-repo user who mistyped would land in whatever store
-the walk found — possibly the local one they moved their secrets out of. Failing loudly is the
-only safe behavior, and every such error names the store and lists the real ones.
+Leftover pointer files are **refused, not skipped**. Skipping would let the walk sail past and
+return some outer store, which is precisely the silent substitution being designed out.
 
 ### Stores vs profiles
 
@@ -127,22 +118,19 @@ answerable without guessing. `envstow store` reports the resolved root and **why
 chosen; `unlock`/`run`/`env` name the store in their banner whenever it isn't a plain local
 `.envstow/` (for which the working directory already says it, and saying more would be noise).
 
-### Joining a central store
+### Joining an external store
 
-A committed store travels with the repo. A central store does not — the pointer names it, but
-nothing transports it. That asymmetry produces one failure the local flow never had.
+A committed store travels with the repo. An external one does not — and since nothing in the
+repo may name it either, joining is entirely a human arrangement: get added as a recipient, then
+obtain the store directory by whatever means the team agreed on.
 
 `envstow init` distinguishes "creating a store" from "joining one" by reading `recipients`: if it
 already lists other people's keys, you're joining, and it says so rather than pretending you can
-decrypt. A git clone supplies that file for free. A central store has no clone step, so on a
-second machine the store directory is simply absent — and the naive path reads that as "nothing
-here yet, create it." The result was two stores with one name, neither aware of the other.
-
-The pointer is the missing evidence: it says *this project's secrets live in a store called
-`acme`*, which is exactly the fact that makes a local create wrong. So `init --store <name>`
-refuses when the repo already points at `<name>` and the store isn't on this machine, printing
-the public key and the join steps instead. Deliberately narrow — a different name, or a repo
-with no pointer, still creates; and once you have the store, `init` is idempotent again.
+decrypt. A git clone supplies that file for free, which is why the in-repo flow gets this right
+without trying. An external store has no clone step, so `init --store <name>` on a machine that
+lacks it genuinely cannot tell "I am starting this store" from "I am joining it" — and creates an
+empty one. Nothing in the tool can distinguish those, which is the honest reason sharing is
+documented as a coordination problem rather than automated.
 
 ### What git was quietly providing
 
@@ -181,8 +169,8 @@ unlocked session. Prints **names only**. Exit = lock.
 
 ### recipient management
 - `envstow init [--store <name> | --store-dir <path>]` — generate an age key, add self as a
-  recipient, create the first file. With `--store`, the store is created centrally and only a
-  pointer file (no ciphertext, no keys) is written into the repo.
+  recipient, create the first file. With `--store`/`--store-dir` the store is created outside the
+  repo and **nothing** is written into it; reach it with the same flag or its env var.
 - `envstow add-recipient <age1...>` / `envstow remove-recipient <age1...|name>` —
   re-encrypt to the new recipient set. Removal prints the rotation reminder (removing a key
   only blocks future commits; rotate to truly revoke).

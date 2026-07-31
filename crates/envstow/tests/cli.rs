@@ -1811,125 +1811,6 @@ fn run_requires_a_command() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn init_with_a_store_name_keeps_everything_out_of_the_repo() {
-    // The public-repo case: nothing encrypted may enter the working tree. What lands in the
-    // repo is a pointer FILE naming the store; the ciphertext and recipients live centrally.
-    let repo = Repo::new("central-init");
-    let out = repo.run(&["init", "--store", "acme", "--no-skill"], "");
-    assert_eq!(out.code, 0, "init --store failed: {}", out.stderr);
-
-    let entry = repo.entry();
-    assert!(
-        entry.is_file(),
-        "`.envstow` in the repo must be a FILE (a pointer), not a store dir"
-    );
-    let text = std::fs::read_to_string(&entry).unwrap();
-    assert!(
-        text.contains("store: acme"),
-        "pointer names the store: {text}"
-    );
-    assert!(
-        !text.contains("age1"),
-        "a pointer must not contain key material: {text}"
-    );
-
-    // The store itself is central, and complete.
-    let central = repo.central_store("acme");
-    assert!(
-        central.join("recipients").is_file(),
-        "central recipients created"
-    );
-    assert!(
-        central.join("default.enc").is_file(),
-        "central store created"
-    );
-
-    // Nothing encrypted anywhere in the repo — the whole point.
-    for e in std::fs::read_dir(&repo.dir).unwrap().flatten() {
-        assert_ne!(
-            e.path().extension().and_then(|s| s.to_str()),
-            Some("enc"),
-            "no ciphertext may be written into the repo: {:?}",
-            e.path()
-        );
-    }
-}
-
-#[test]
-fn a_pointer_file_resolves_with_no_flag_at_all() {
-    // The reason the pointer exists: after init, ordinary commands in this repo just work.
-    // If this needed `--store` every time, forgetting it would fall through to the walk.
-    let repo = Repo::new("central-use");
-    assert_eq!(
-        repo.run(&["init", "--store", "acme", "--no-skill"], "")
-            .code,
-        0
-    );
-
-    assert_eq!(repo.run(&["set", "TOKEN"], "s3cr3t").code, 0);
-    let listed = repo.run(&["list"], "");
-    assert!(
-        listed.stdout.contains("TOKEN"),
-        "set/list via pointer: {}",
-        listed.stdout
-    );
-
-    // And the value round-trips through the child environment.
-    let got = repo.run(&["run", "--", "sh", "-c", "printf '%s' \"$TOKEN\""], "");
-    assert_eq!(
-        got.stdout, "s3cr3t",
-        "value round-trips via the central store"
-    );
-
-    // A subdirectory still resolves — the walk finds the pointer above it.
-    let sub = repo.dir.join("nested/deep");
-    std::fs::create_dir_all(&sub).unwrap();
-    let mut cmd = Command::new(BIN);
-    cmd.args(["list"])
-        .current_dir(&sub)
-        .env("ENVSTOW_IDENTITY", &repo.identity)
-        .env("XDG_CONFIG_HOME", &repo.config)
-        .env("APPDATA", &repo.config);
-    clear_agent_markers(&mut cmd);
-    let out = cmd.output().unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("TOKEN"),
-        "the walk must find a pointer from a subdirectory too"
-    );
-}
-
-#[test]
-fn a_dangling_pointer_fails_loudly_instead_of_finding_another_store() {
-    // Clone a repo whose central store you don't have. The failure must NAME the store and say
-    // how to get one — never silently resolve elsewhere, which for this feature's whole purpose
-    // would mean falling back to a store the user meant to avoid.
-    let repo = Repo::new("dangling");
-    std::fs::write(repo.entry(), "store: notmine\n").unwrap();
-
-    let out = repo.run(&["list"], "");
-    assert_ne!(out.code, 0, "a dangling pointer must fail");
-    assert!(
-        out.stderr.contains("notmine") && out.stderr.contains("init --store notmine"),
-        "must name the store and the fix: {}",
-        out.stderr
-    );
-}
-
-#[test]
-fn a_malformed_pointer_is_an_error_not_a_fallthrough() {
-    let repo = Repo::new("badpointer");
-    std::fs::write(repo.entry(), "this is not a pointer\n").unwrap();
-
-    let out = repo.run(&["list"], "");
-    assert_ne!(out.code, 0, "an unreadable pointer must fail");
-    assert!(
-        out.stderr.contains("store: <name>"),
-        "must show the expected format: {}",
-        out.stderr
-    );
-}
-
-#[test]
 fn a_local_store_still_works_exactly_as_before() {
     // The backward-compatibility guarantee: plain `init` is untouched by any of this.
     let repo = Repo::new("local-still");
@@ -1938,27 +1819,6 @@ fn a_local_store_still_works_exactly_as_before() {
     assert!(repo.store().is_file(), "…containing the store");
     assert_eq!(repo.run(&["set", "K"], "v").code, 0);
     assert!(repo.run(&["list"], "").stdout.contains("K"));
-}
-
-#[test]
-fn init_refuses_to_clobber_a_pointer_with_a_local_store() {
-    // `.envstow` is a file OR a directory, never both. A plain `init` on top of a pointer must
-    // refuse: the pointer may name the only copy of someone's secrets.
-    let repo = Repo::new("clobber");
-    assert_eq!(
-        repo.run(&["init", "--store", "acme", "--no-skill"], "")
-            .code,
-        0
-    );
-
-    let out = repo.run(&["init", "--no-skill"], "");
-    assert_ne!(out.code, 0, "plain init over a pointer must refuse");
-    assert!(
-        out.stderr.contains("pointer"),
-        "must explain why: {}",
-        out.stderr
-    );
-    assert!(repo.entry().is_file(), "the pointer must survive untouched");
 }
 
 #[test]
@@ -2081,196 +1941,122 @@ fn store_dir_points_at_an_arbitrary_directory() {
         .contains('S'));
 }
 
+// ---------------------------------------------------------------------------
+// external stores: reachable only by explicit selection, never by a committed file
+// ---------------------------------------------------------------------------
+
 #[test]
-fn init_refuses_to_fork_a_store_this_repo_already_points_at() {
-    // Joining a colleague's central-store project. The local flow catches this for free — a
-    // clone brings `recipients` along, so init sees other keys and says "you're joining." A
-    // central store isn't cloned, so without this guard init happily makes a SECOND empty store
-    // with the same name: two stores, no sync, and nothing to tell you they diverged.
-    let repo = Repo::new("fork-guard");
+fn init_with_a_store_name_writes_nothing_into_the_repo() {
+    // The whole point of dropping pointer files: a checkout can't say where secrets come from.
+    let repo = Repo::new("ext-init");
+    let out = repo.run(&["init", "--store", "acme", "--no-skill"], "");
+    assert_eq!(out.code, 0, "init --store failed: {}", out.stderr);
+
+    assert!(
+        repo.central_store("acme").join("default.enc").is_file(),
+        "the external store itself is created"
+    );
+    assert!(
+        !repo.entry().exists(),
+        "NOTHING may be written into the repo — not a store, not a pointer"
+    );
+    // Having created it, the user needs to know how to reach it; there's no file to remind them.
+    assert!(
+        out.stderr.contains("--store acme") || out.stderr.contains("ENVSTOW_STORE=acme"),
+        "must say how to reach a store nothing points at: {}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_committed_file_cannot_redirect_where_secrets_come_from() {
+    // The hazard this design removes. Alice keeps secrets in an external store; someone commits
+    // a local `.envstow/` holding DIFFERENT values. Alice's own command must keep resolving to
+    // her store — a pull must never silently swap the secret underneath her.
+    let repo = Repo::new("no-redirect");
     assert_eq!(
         repo.run(&["init", "--store", "acme", "--no-skill"], "")
             .code,
         0
     );
-    assert_eq!(repo.run(&["set", "SHARED"], "alice-val").code, 0);
-
-    // A second machine: same repo (same pointer), different identity AND config dir.
-    let other_cfg = repo.dir.join("other-cfg");
-    let other_id = repo.dir.join("other-id.txt");
-    let mut cmd = Command::new(BIN);
-    cmd.args(["init", "--store", "acme", "--no-skill"])
-        .current_dir(&repo.dir)
-        .env("ENVSTOW_IDENTITY", &other_id)
-        .env("XDG_CONFIG_HOME", &other_cfg)
-        .env("APPDATA", &other_cfg);
-    clear_agent_markers(&mut cmd);
-    let out = cmd.output().unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
-
-    assert!(!out.status.success(), "must refuse, got: {err}");
-    assert!(
-        err.contains("already points at the central store 'acme'"),
-        "must name the store and the situation: {err}"
-    );
-    assert!(
-        err.contains("add-recipient"),
-        "must show how to actually join: {err}"
-    );
-    // Refusing is only half the job — the message routes by what the user was trying to do,
-    // since `init --store` here could equally mean "join", "start a separate store", or "I
-    // want secrets in the repo after all".
-    assert!(
-        err.matches("If you're trying to").count() >= 2,
-        "must name the alternative intents too, not just the likeliest: {err}"
-    );
-    assert!(
-        !other_cfg.join("envstow/stores/acme/default.enc").is_file(),
-        "the divergent store must NOT have been created"
-    );
-
-    // The original store is untouched, and its owner can still re-init idempotently.
-    assert!(repo.run(&["list"], "").stdout.contains("SHARED"));
     assert_eq!(
-        repo.run(&["init", "--store", "acme", "--no-skill"], "")
+        repo.run(&["--store", "acme", "set", "API_KEY"], "PROD-real")
             .code,
-        0,
-        "the owner (who HAS the store) must still be able to re-run init"
+        0
     );
 
-    // A differently-named store here is a deliberate act, not a fork — still allowed.
-    let mut cmd = Command::new(BIN);
-    cmd.args(["init", "--store", "unrelated", "--no-skill"])
-        .current_dir(&repo.dir)
-        .env("ENVSTOW_IDENTITY", &other_id)
-        .env("XDG_CONFIG_HOME", &other_cfg)
-        .env("APPDATA", &other_cfg);
-    clear_agent_markers(&mut cmd);
-    assert!(
-        cmd.output().unwrap().status.success(),
-        "a different store name is not a fork"
+    // Someone adds a repo-local store with a conflicting value for the same name.
+    assert_eq!(repo.run(&["init", "--no-skill"], "").code, 0);
+    assert_eq!(repo.run(&["set", "API_KEY"], "STALE-wrong").code, 0);
+
+    let got = repo.run(
+        &[
+            "--store",
+            "acme",
+            "run",
+            "--only",
+            "API_KEY",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s' \"$API_KEY\"",
+        ],
+        "",
+    );
+    assert_eq!(
+        got.stdout, "PROD-real",
+        "an explicit --store must be unaffected by anything committed"
     );
 }
 
 #[test]
-fn plain_init_over_a_pointer_advises_by_whether_the_store_is_here() {
-    // Cloning a repo that carries a committed pointer and reflexively running `envstow init` is
-    // the likeliest way to meet this error, and in that case the store is NOT on the machine —
-    // so "add secrets with `envstow set`" would send the user straight into a second failure.
-    // The advice has to split on whether the named store actually exists.
-    let repo = Repo::new("ptr-init");
+fn a_legacy_pointer_file_is_refused_with_migration_advice() {
+    // Repos that still carry a pointer from the old scheme. It must NOT be skipped — skipping
+    // would let the walk find some other store, which is the silent substitution being removed.
+    let repo = Repo::new("legacy-ptr");
     std::fs::write(repo.entry(), "store: acme\n").unwrap();
 
-    let absent = repo.run(&["init", "--no-skill"], "");
-    assert_ne!(absent.code, 0, "must refuse to clobber the pointer");
-    assert!(
-        absent.stderr.contains("init --store acme"),
-        "with the store absent, must point at the join command: {}",
-        absent.stderr
-    );
-    assert!(
-        !absent.stderr.contains("envstow set"),
-        "must NOT suggest `set`, which cannot work without the store: {}",
-        absent.stderr
-    );
-    // Each branch is written as "if you're trying to X, do Y" so the reader picks their intent
-    // instead of decoding a bare statement of fact.
-    assert!(
-        absent.stderr.matches("If you're trying to").count() >= 2,
-        "must offer the alternative intents, not just the likeliest one: {}",
-        absent.stderr
-    );
-    assert!(
-        absent.stderr.contains("rm ") && absent.stderr.contains("&& envstow init"),
-        "must spell out the local-store escape hatch as a runnable command: {}",
-        absent.stderr
-    );
+    for args in [&["list"][..], &["init", "--no-skill"][..]] {
+        let out = repo.run(args, "");
+        assert_ne!(out.code, 0, "`{args:?}` must refuse a pointer file");
+        assert!(
+            out.stderr.contains("acme"),
+            "names the store it mentioned: {}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("no longer follows"),
+            "says this is deliberate, not a bug: {}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("--store") && out.stderr.contains("&& envstow init"),
+            "offers both the per-command route and moving into the repo: {}",
+            out.stderr
+        );
+    }
 
-    // Now actually acquire the store the pointer names, and the advice should flip. Created from
-    // a directory WITHOUT that pointer — from inside this repo, the fork guard would (rightly)
-    // refuse, since a pointer plus a missing store means "join", not "create".
-    let elsewhere = repo.dir.join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).unwrap();
-    let mut cmd = Command::new(BIN);
-    cmd.args(["init", "--store", "acme", "--no-skill"])
-        .current_dir(&elsewhere)
-        .env("ENVSTOW_IDENTITY", &repo.identity)
-        .env("XDG_CONFIG_HOME", &repo.config)
-        .env("APPDATA", &repo.config);
-    clear_agent_markers(&mut cmd);
-    assert!(cmd.output().unwrap().status.success(), "create the store");
-    let present = repo.run(&["init", "--no-skill"], "");
-    assert_ne!(present.code, 0, "still refuses — there's nothing to init");
-    assert!(
-        present.stderr.contains("envstow set"),
-        "with the store present, `set` IS the right next step: {}",
-        present.stderr
-    );
-
-    // An unreadable pointer shouldn't guess a store name.
-    std::fs::write(repo.entry(), "garbage\n").unwrap();
-    let bad = repo.run(&["init", "--no-skill"], "");
-    assert_ne!(bad.code, 0);
-    assert!(
-        bad.stderr.contains("unreadable as a pointer"),
-        "must say the file is unreadable rather than invent a name: {}",
-        bad.stderr
-    );
-    assert!(
-        !bad.stderr.contains("--store "),
-        "must not guess a store name it couldn't parse: {}",
-        bad.stderr
-    );
-
-    // The escape hatch every branch advertises must actually work.
+    // The advertised migration works, and does not touch the external store.
     std::fs::remove_file(repo.entry()).unwrap();
-    assert_eq!(
-        repo.run(&["init", "--no-skill"], "").code,
-        0,
-        "deleting the pointer must allow a local store"
-    );
-    assert!(repo.entry().is_dir(), "…and that store is a directory");
+    assert_eq!(repo.run(&["init", "--no-skill"], "").code, 0);
+    assert!(repo.entry().is_dir(), "…leaving a normal local store");
 }
 
 #[test]
-fn creating_a_store_beside_a_pointer_to_another_does_not_claim_ready() {
-    // Following the "START A SEPARATE store" advice used to end in "Ready" while the directory
-    // still resolved to the OTHER store — the user does exactly what they were told, is told it
-    // worked, and every subsequent command fails. Creating the store is right; claiming the
-    // repo is usable is not.
-    let repo = Repo::new("ptr-conflict");
-    std::fs::write(repo.entry(), "store: acme\n").unwrap();
+fn an_unreadable_pointer_still_gets_advice_without_inventing_a_name() {
+    let repo = Repo::new("legacy-junk");
+    std::fs::write(repo.entry(), "gitdir: /somewhere\n").unwrap();
 
-    let out = repo.run(&["init", "--store", "other", "--no-skill"], "");
-    assert_eq!(out.code, 0, "creating a differently-named store is allowed");
+    let out = repo.run(&["list"], "");
+    assert_ne!(out.code, 0);
     assert!(
-        repo.central_store("other").join("default.enc").is_file(),
-        "the store itself must still be created"
-    );
-    assert!(
-        !out.stderr.contains("Ready."),
-        "must NOT claim ready — this directory still points at 'acme': {}",
+        out.stderr.contains("an external store"),
+        "falls back to a generic phrase: {}",
         out.stderr
     );
     assert!(
-        out.stderr.contains("still points at 'acme'"),
-        "must say which store the directory actually resolves to: {}",
+        !out.stderr.contains("/somewhere"),
+        "must not echo an unvalidated name as if it were a store: {}",
         out.stderr
     );
-    assert!(
-        out.stderr.contains("store: other"),
-        "must give the command that repoints this project: {}",
-        out.stderr
-    );
-    // The pointer is NOT rewritten behind the user's back — repointing is their call.
-    assert_eq!(
-        std::fs::read_to_string(repo.entry()).unwrap().trim(),
-        "store: acme",
-        "init must not silently repoint the project"
-    );
-
-    // And the suggested fix genuinely works.
-    std::fs::write(repo.entry(), "store: other\n").unwrap();
-    assert_eq!(repo.run(&["set", "K"], "v").code, 0);
-    assert!(repo.run(&["list"], "").stdout.contains('K'));
 }

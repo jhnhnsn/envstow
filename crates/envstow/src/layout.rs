@@ -17,40 +17,45 @@
 //!
 //! Where the store root comes from
 //! -------------------------------
-//! Two kinds of store, resolved by [`resolve_root`]:
+//! Resolved by [`resolve_root`], from exactly two kinds of source:
 //!
-//!   * **Local** — `.envstow/` beside your code, found by walking up from the CWD. This is
-//!     envstow's original and still default model: the store is committed with the repo, so it
-//!     travels to collaborators the same way the code does.
-//!   * **Central** — `~/.config/envstow/stores/<name>/`, addressed by NAME rather than path.
-//!     For work where a committed store is wrong or impossible: a public repo whose owner does
-//!     not want a permanent ciphertext record in it, or collaborators sharing a synced folder
-//!     rather than a git remote.
+//!   * **The repo** — `.envstow/` beside your code, found by walking up from the CWD. The
+//!     default, and the only kind anything committed can select. The store travels to
+//!     collaborators the same way the code does.
+//!   * **Somewhere else, said explicitly** — `--store <name>` (a directory under
+//!     `~/.config/envstow/stores/`) or `--store-dir <path>` (anywhere: a synced folder, a
+//!     mounted path in CI), or the matching env vars. Never committed, never inferred.
 //!
-//! `.envstow` is a file OR a directory
-//! -----------------------------------
-//! A repo that uses a central store still needs to say so, or every command needs a flag. It
-//! does that with a `.envstow` FILE (rather than a directory) containing `store: <name>`.
-//! Same name, and the filesystem type discriminates — this is exactly what git does for
-//! worktrees and submodules, where `.git` is a file holding `gitdir: <path>`.
+//! Why nothing committed can point outside the repo
+//! ------------------------------------------------
+//! A `.envstow` FILE containing `store: <name>` used to work: a committed redirect saying
+//! *this project's secrets live elsewhere*, so commands here needed no flag. It was removed.
 //!
-//! Using one name for both cases is what keeps the model small: a path is a file or a
-//! directory, never both, so "this repo has a local store AND a pointer to a central one" is
-//! unrepresentable rather than an ambiguity to resolve. The alternative — a pointer at
-//! `.envstow/store`, beside the stores — would have needed a rule for that collision, and any
-//! rule that silently picks a winner picks the wrong store some of the time. In a secrets tool
-//! that is the failure worth designing out.
+//! The problem is what it makes possible. Where a project's secrets come from becomes a thing
+//! one person can change and everyone else inherits on the next `git pull` — and the switch
+//! from an external store to a committed one is *silent*, because a local `.envstow/` is a
+//! perfectly plausible answer with nothing for the resolver to be suspicious of. Same command,
+//! same directory, different secret. For anyone who is a recipient of both stores (which
+//! happens the moment they have ever run `init` in that repo), the wrong value is simply used.
 //!
-//! The pointer holds a NAME, not a path, which is what makes it safe to commit: it resolves
-//! under each collaborator's own home directory, leaks nothing beyond the fact that envstow is
-//! in use, and doesn't break when someone's layout differs.
+//! Making a redirect uncommittable removes the failure class rather than detecting it after the
+//! fact. The cost is real — reaching an external store now means a flag or an exported variable
+//! every time, and forgetting falls back to the walk — but that failure is one person's, in
+//! their own shell, and recoverable. The other silently changed everyone's secrets.
+//!
+//! Coordination moves to where it belongs: if a team shares an external store, they have to
+//! agree how, because no file in the repo will arrange it for them.
+//!
+//! Files left over from the old scheme are not skipped — a `.envstow` file stops the walk with
+//! [`LayoutError::PointerUnsupported`], since skipping is the very silent substitution this
+//! removal exists to prevent.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// A repo's envstow entry: a directory holding a local store, or a file pointing at a central
-/// one. See the module docs for why one name covers both.
+/// The repo's store directory. A `.envstow` FILE is a leftover redirect from an older scheme
+/// and is refused rather than followed — see the module docs.
 pub const ENVSTOW_DIR: &str = ".envstow";
 /// The name of the default (unnamed) profile.
 pub const DEFAULT_PROFILE: &str = "default";
@@ -156,8 +161,6 @@ pub enum StoreSource {
     ExplicitDir,
     /// `--store <name>` or `$ENVSTOW_STORE` → a central store.
     NamedFlag(String),
-    /// A committed `.envstow` pointer file naming a central store.
-    Pointer { name: String, from: PathBuf },
     /// A `.envstow/` directory found by walking up from the CWD — the original model.
     LocalDir,
 }
@@ -167,10 +170,7 @@ impl StoreSource {
     pub fn describe(&self) -> String {
         match self {
             StoreSource::ExplicitDir => "from --store-dir".to_string(),
-            StoreSource::NamedFlag(n) => format!("central store '{n}'"),
-            StoreSource::Pointer { name, from } => {
-                format!("central store '{name}', via {}", from.display())
-            }
+            StoreSource::NamedFlag(n) => format!("external store '{n}'"),
             StoreSource::LocalDir => "local .envstow/ directory".to_string(),
         }
     }
@@ -219,69 +219,36 @@ pub fn list_central_stores() -> Vec<String> {
     names
 }
 
-/// Parse a `.envstow` pointer file's contents into the central store name it names.
+/// The store name a legacy `.envstow` pointer file names, or `None` if it names nothing legible.
 ///
-/// Accepts blank lines and `#` comments so the file can carry a note explaining itself to
-/// whoever finds it in a clone. Anything else — no `store:` line, an empty value, an invalid
-/// name — is an error rather than a fallback: a pointer we can't read must not silently
-/// degrade into "no store here", which would send the caller to some other store entirely.
-fn parse_pointer(text: &str) -> Result<String, LayoutError> {
+/// envstow no longer resolves through these files — see [`discover_root`] — but reading the name
+/// out of one still makes the "this project uses an external store" error concrete rather than
+/// generic. Best-effort by design: an unparseable file simply has no name to report, and the
+/// error says the same thing either way.
+pub fn parse_pointer_name(text: &str) -> Option<String> {
     for line in text.lines() {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
-        let Some(value) = t.strip_prefix(POINTER_PREFIX) else {
-            return Err(LayoutError::BadPointer(format!(
-                "expected a `{POINTER_PREFIX} <name>` line, found `{t}`"
-            )));
-        };
-        let name = value.trim();
-        if name.is_empty() {
-            return Err(LayoutError::BadPointer(format!(
-                "`{POINTER_PREFIX}` has no store name after it"
-            )));
-        }
-        if !valid_store_name(name) {
-            return Err(LayoutError::BadPointer(format!(
-                "invalid store name '{name}' (use letters, digits, - or _)"
-            )));
-        }
-        return Ok(name.to_string());
+        let name = t.strip_prefix(POINTER_PREFIX)?.trim();
+        return valid_store_name(name).then(|| name.to_string());
     }
-    Err(LayoutError::BadPointer(format!(
-        "no `{POINTER_PREFIX} <name>` line found"
-    )))
+    None
 }
 
-/// The store name a pointer file's text names, or `None` if it isn't a readable pointer.
-///
-/// The lossy counterpart to [`parse_pointer`], for callers that are *asking whether* a pointer
-/// names something rather than resolving through one. `init` uses it to notice that a repo
-/// already points at the store being created; a malformed pointer is simply "not that store"
-/// there, since the resolving path will report it properly the moment anything reads a secret.
-pub fn parse_pointer_name(text: &str) -> Option<String> {
-    parse_pointer(text).ok()
-}
-
-/// Render a pointer file's contents, with a comment explaining it to whoever finds it.
-pub fn render_pointer(name: &str) -> String {
-    format!(
-        "# envstow: this project's secrets live in a central store, NOT in this repo.\n\
-         # Each collaborator keeps their own copy at ~/.config/envstow/stores/{name}/.\n\
-         # This file names it; it contains no secrets and is safe to commit.\n\
-         {POINTER_PREFIX} {name}\n"
-    )
-}
-
-/// Walk up from the CWD looking for a `.envstow` entry, and resolve it to a store root.
-///
-/// One probe per level, then branch on what was found:
-///   * a directory → a local store, rooted there (envstow's original behavior, unchanged);
-///   * a file      → a pointer naming a central store.
+/// Walk up from the CWD looking for a `.envstow` directory, and use it as the store root.
 ///
 /// Nearest wins, so a nested project overrides an outer one, matching how the walk has always
 /// behaved and how git resolves `.git`.
+///
+/// A `.envstow` FILE stops the walk with [`LayoutError::PointerUnsupported`]. Such a file used
+/// to be a "pointer" naming a store under `~/.config/envstow/stores/` — a committed redirect
+/// saying *this project's secrets live elsewhere*. That was removed (see the module docs): a
+/// committed file that changes where secrets resolve is a change one person can make and
+/// everyone else silently inherits on the next pull. It stops the walk rather than being
+/// skipped, because skipping is precisely the silent substitution the removal exists to
+/// prevent — the walk would sail past and hand back some outer store instead.
 fn discover_root() -> Result<(PathBuf, StoreSource), LayoutError> {
     let mut dir = env::current_dir().map_err(|e| LayoutError::Io(e.to_string()))?;
     loop {
@@ -296,23 +263,15 @@ fn discover_root() -> Result<(PathBuf, StoreSource), LayoutError> {
                 }
             }
             Ok(_) => {
-                let text = fs::read_to_string(&cand).map_err(|e| LayoutError::Io(e.to_string()))?;
-                let name = parse_pointer(&text)?;
-                let root = central_store_path(&name);
-                if !root.join(RECIPIENTS_NAME).is_file() {
-                    return Err(LayoutError::PointerDangling {
-                        name,
-                        from: cand,
-                        expected: root,
-                    });
-                }
-                return Ok((
-                    root,
-                    StoreSource::Pointer {
-                        name,
-                        from: cand.clone(),
-                    },
-                ));
+                // Name the store if the file is a readable pointer — it makes the message
+                // actionable — but never resolve through it.
+                let named = fs::read_to_string(&cand)
+                    .ok()
+                    .and_then(|t| parse_pointer_name(&t));
+                return Err(LayoutError::PointerUnsupported {
+                    from: cand,
+                    name: named,
+                });
             }
             Err(_) => {}
         }
@@ -378,13 +337,11 @@ pub enum LayoutError {
     },
     /// The header is present but unparseable — a truncated or corrupted file.
     BadFormatHeader,
-    /// A `.envstow` pointer file exists but can't be read as one.
-    BadPointer(String),
-    /// A pointer names a central store that isn't on this machine.
-    PointerDangling {
-        name: String,
+    /// `.envstow` is a FILE — a legacy committed pointer to an external store, no longer
+    /// resolved. `name` is the store it named, if the file is still legible.
+    PointerUnsupported {
         from: PathBuf,
-        expected: PathBuf,
+        name: Option<String>,
     },
     /// `--store <name>` named a central store that doesn't exist.
     NoSuchStore {
@@ -452,37 +409,37 @@ impl std::fmt::Display for LayoutError {
                  (`git checkout -- {ENVSTOW_DIR}`).",
                 FORMAT_PREFIX.trim_end()
             ),
-            LayoutError::BadPointer(why) => write!(
-                f,
-                "the `{ENVSTOW_DIR}` file is not a valid store pointer: {why}.\n\
-                 \x20  A pointer file contains one line: `{POINTER_PREFIX} <name>`.\n\
-                 \x20  (A `{ENVSTOW_DIR}` DIRECTORY holds a store directly; a FILE points at a \
-                 central one.)"
-            ),
-            // The error a new collaborator meets first — any command hits it, not just `init`.
-            // "Create it" alone is a trap: for the likeliest reader (just cloned, wants the
-            // team's secrets) creating an empty store is exactly the wrong move, so each intent
-            // gets named and pointed at its own command.
-            LayoutError::PointerDangling {
-                name,
-                from,
-                expected,
-            } => write!(
-                f,
-                "{} says this project's secrets live in the central store '{name}',\n\
-                 \x20 but that store isn't on this machine (looked in {}).\n\
-                 \n\
-                 \x20  If you're trying to GET THIS PROJECT'S SECRETS (most likely — you \
-                 cloned it):\n\
-                 \x20    envstow init --store {name}   …prints the steps to join\n\
-                 \x20  If you're trying to USE A DIFFERENT STORE you already have:\n\
-                 \x20    envstow store   …lists them\n\
-                 \x20  If this project's secrets should live IN THE REPO instead:\n\
-                 \x20    rm {} && envstow init",
-                from.display(),
-                expected.display(),
-                from.display()
-            ),
+            // A committed file that redirects where secrets come from is a change one person
+            // makes and everyone else inherits on the next pull — silently, since a store found
+            // by the walk looks like a perfectly good answer. envstow no longer follows these.
+            // The message explains the situation and hands the coordination back to the humans:
+            // how a team shares an external store is a conversation, not something a file in the
+            // repo can decide for everyone.
+            LayoutError::PointerUnsupported { from, name } => {
+                let store = match name {
+                    Some(n) => format!("the external store '{n}'"),
+                    None => "an external store".to_string(),
+                };
+                write!(
+                    f,
+                    "{} is a FILE saying this project's secrets live in {store}.\n\
+                     \x20 envstow no longer follows these — a committed file that redirects \
+                     where secrets\n\
+                     \x20 come from silently changes them for everyone on the next pull.\n\
+                     \n\
+                     \x20  If you HAVE that store, name it per command (nothing to commit):\n\
+                     \x20    envstow --store <name> <command>     …or export ENVSTOW_STORE=<name>\n\
+                     \x20    envstow store                        …lists the stores you have\n\
+                     \x20  If you DON'T have it, ask whoever set this up to share it — and agree \
+                     with\n\
+                     \x20  them how you'll keep it in sync, since git won't do it for you.\n\
+                     \x20  If this project's secrets should live IN THE REPO (simplest for a \
+                     team):\n\
+                     \x20    rm {} && envstow init",
+                    from.display(),
+                    from.display()
+                )
+            }
             LayoutError::NoSuchStore { name, known } => {
                 write!(f, "no central store named '{name}'.")?;
                 if known.is_empty() {
@@ -920,20 +877,21 @@ mod tests {
     }
 
     #[test]
-    fn pointer_parses_a_name_ignoring_comments_and_blanks() {
-        // The rendered file leads with explanatory comments — parsing must see past them, or
-        // the very file envstow writes wouldn't read back.
-        let text = render_pointer("acme");
-        assert_eq!(parse_pointer(&text).unwrap(), "acme");
-        assert_eq!(parse_pointer("store: acme\n").unwrap(), "acme");
-        assert_eq!(parse_pointer("\n#note\nstore:  acme  \n").unwrap(), "acme");
+    fn a_legacy_pointer_name_is_read_for_the_message_only() {
+        // Not resolution — these files are never followed. The name just makes the "this project
+        // uses an external store" error concrete, so it's read past comments and blanks the way
+        // the old writer emitted them.
+        assert_eq!(parse_pointer_name("store: acme\n").as_deref(), Some("acme"));
+        assert_eq!(
+            parse_pointer_name("# a note\n\nstore:  acme  \n").as_deref(),
+            Some("acme")
+        );
     }
 
     #[test]
-    fn a_pointer_we_cannot_read_is_an_error_not_a_shrug() {
-        // Every one of these must FAIL rather than resolve to "no store here". Falling through
-        // would send the caller to whatever the walk finds next — for the public-repo case,
-        // precisely the store they moved their secrets out of.
+    fn an_illegible_pointer_yields_no_name_rather_than_a_guess() {
+        // A name that isn't a safe directory component must not come back — the error prints it,
+        // and `store: ../../etc` should never be echoed as though envstow would go there.
         for bad in [
             "",                     // empty file
             "\n\n",                 // only blanks
@@ -944,9 +902,10 @@ mod tests {
             "store: has spaces\n",  // not a valid directory component
             "gitdir: /somewhere\n", // right shape, wrong tool
         ] {
-            assert!(
-                matches!(parse_pointer(bad), Err(LayoutError::BadPointer(_))),
-                "should reject pointer {bad:?}"
+            assert_eq!(
+                parse_pointer_name(bad),
+                None,
+                "should not extract a name from {bad:?}"
             );
         }
     }
@@ -1002,23 +961,40 @@ mod tests {
     fn store_errors_say_what_to_do_next() {
         // These messages ARE the feature for anyone who mistypes a store name or clones a repo
         // whose central store they don't have yet.
-        let dangling = LayoutError::PointerDangling {
-            name: "acme".into(),
+        // The legacy-pointer error is the one a teammate meets after pulling a repo that still
+        // carries one. It has to explain WHY envstow won't follow it (or it reads as a bug),
+        // and hand the sync question back to the people involved.
+        let legacy = LayoutError::PointerUnsupported {
             from: PathBuf::from("/repo/.envstow"),
-            expected: PathBuf::from("/home/u/.config/envstow/stores/acme"),
+            name: Some("acme".into()),
         }
         .to_string();
-        assert!(dangling.contains("acme"), "names the store");
-        assert!(dangling.contains("/repo/.envstow"), "names the pointer");
-        // This is the first error a new collaborator meets, from ANY command — so it routes by
-        // what they were trying to do rather than stating the problem and stopping.
+        assert!(legacy.contains("acme"), "names the store: {legacy}");
         assert!(
-            dangling.matches("If you're trying to").count() >= 2,
-            "must offer more than one intent: {dangling}"
+            legacy.contains("/repo/.envstow"),
+            "names the file: {legacy}"
         );
         assert!(
-            dangling.contains("envstow init --store acme"),
-            "tells them how to create it: {dangling}"
+            legacy.contains("no longer follows"),
+            "says this is deliberate, not broken: {legacy}"
+        );
+        assert!(
+            legacy.matches("If you").count() >= 2,
+            "routes by what the reader was trying to do: {legacy}"
+        );
+        assert!(
+            legacy.contains("--store") && legacy.contains("&& envstow init"),
+            "gives both the per-command route and the move-into-the-repo route: {legacy}"
+        );
+        // With no legible name it must still be a complete instruction, not a half-sentence.
+        let anon = LayoutError::PointerUnsupported {
+            from: PathBuf::from("/repo/.envstow"),
+            name: None,
+        }
+        .to_string();
+        assert!(
+            anon.contains("an external store") && anon.contains("--store"),
+            "an unreadable pointer still gets actionable advice: {anon}"
         );
 
         let unknown = LayoutError::NoSuchStore {
@@ -1029,16 +1005,6 @@ mod tests {
         assert!(
             unknown.contains("acme, side"),
             "lists what DOES exist, so a typo is obvious: {unknown}"
-        );
-
-        let bad = LayoutError::BadPointer("no `store:` line found".into()).to_string();
-        assert!(
-            bad.contains("store: <name>"),
-            "shows the expected format: {bad}"
-        );
-        assert!(
-            bad.contains("DIRECTORY") && bad.contains("FILE"),
-            "explains the file-vs-directory distinction: {bad}"
         );
     }
 
