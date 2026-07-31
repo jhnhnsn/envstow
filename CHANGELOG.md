@@ -34,6 +34,12 @@ All notable changes to envstow are documented here. Versions follow [SemVer](htt
   written into the working directory, the walk will never find it — so the closing line names the
   flag (or env var) instead of leaving the next command to fail with "no store found".
 
+### Documentation
+- **External stores are documented as a use case**, not just a mechanism: a scenario covering the
+  three situations that call for one (a public repo, secrets shared across projects, a team with
+  no git remote), the trade it asks for, and the sharing story. The Stores section, DESIGN.md,
+  CLAUDE.md, and the agent skill are rewritten for the removal above.
+
 ## 0.2.1
 
 ### Fixed
