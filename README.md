@@ -619,11 +619,36 @@ git history. Treat those secrets as exposed and **rotate at the source** — the
 
 Two things an external store loses:
 
-- **Concurrent writes can clobber.** Two people running `envstow set` against the same shared
-  folder produces a last-writer-wins overwrite or a sync-conflict copy. Git would have refused
-  the push. **envstow does not guard this** — coordinate writes, or use git.
 - **No history.** A bad `reencrypt` or an accidental `delete` is recoverable from git; from a
   shared folder, only via your sync service's own version history.
+- **No merge.** Two people can't edit the same store concurrently and have both changes survive.
+  envstow refuses the losing write rather than dropping a secret (below), but the loser has to
+  re-run — there's no equivalent of `git pull --rebase`.
+
+### Concurrent writes
+
+Every envstow write is read-modify-write: decrypt the whole store, change one key, re-encrypt
+the whole thing. If two people do that at once, the second write is built on contents that
+predate the first — so "last one wins" quietly loses a secret.
+
+envstow checks the store hasn't changed since the command read it, and refuses rather than
+overwrite:
+
+```
+envstow: could not write store: someone else changed this store while your command was running, so writing
+  now would silently discard their change:
+    /shared/team-secrets/default.enc
+
+  Nothing was written — your change is the one that didn't happen. Re-run the
+  same command and it will apply on top of theirs.
+```
+
+Re-running applies your change on top of theirs. The check compares the file's actual bytes, not
+its timestamp — sync clients rewrite files with timestamps that don't reflect edit order.
+
+This makes the failure loud rather than impossible: you still can't have two people editing one
+store at the same moment. A committed store gets the stronger guarantee, because git refuses the
+push and makes you pull first.
 
 Error messages adapt: advice like `git pull && envstow reencrypt && git add .envstow` only
 appears when the store actually is in a git work tree.

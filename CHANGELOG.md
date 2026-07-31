@@ -2,6 +2,27 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
+## 0.2.3
+
+### Added
+- **Concurrent writes no longer silently discard each other.** Every envstow write is
+  read-modify-write over the whole store — decrypt it, change one key, re-encrypt all of it — so
+  two people writing at once meant the second re-encrypted contents that predated the first, and
+  a secret vanished with no error. Git refuses the equivalent push and makes you pull; a synced
+  folder can't, so envstow now checks itself.
+
+  `set`, `delete`, and `reencrypt` capture the store's state when they read it and refuse to
+  write if the file changed since, telling the loser that nothing was written and to re-run —
+  which then applies their change on top. `init` and `profile create` use the same mechanism to
+  require the store still be absent, so two concurrent creates can't clobber one another.
+
+  The check compares the file's actual bytes rather than its mtime: sync clients rewrite files
+  with timestamps that don't reflect edit order, some restore an older mtime wholesale, and
+  coarse filesystem timestamp resolution can make two writes a second apart look identical.
+
+  This makes the loss loud, not impossible — there's still no merge, so the loser re-runs. A
+  committed store keeps the stronger guarantee, since git blocks the push in the first place.
+
 ## 0.2.2
 
 ### Removed

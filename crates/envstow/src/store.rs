@@ -14,6 +14,18 @@ use crate::secrets::Secrets;
 /// Decrypt the selected store for `profile` with the user's identity into a [`Secrets`] (whose
 /// values are zeroized on drop).
 pub fn load_secrets_in(sel: &layout::StoreSelector, profile: &str) -> Result<Secrets, AppError> {
+    load_secrets_versioned(sel, profile).map(|(secrets, _)| secrets)
+}
+
+/// [`load_secrets_in`], also returning the store's on-disk state at the moment it was read.
+///
+/// Commands that write the store back must use this and hand the [`layout::StoreVersion`] to
+/// [`write_secrets`], so a concurrent writer can't be silently overwritten. Read-only commands
+/// (`get`, `list`, `run`) have nothing to protect and use the plain version.
+pub fn load_secrets_versioned(
+    sel: &layout::StoreSelector,
+    profile: &str,
+) -> Result<(Secrets, layout::StoreVersion), AppError> {
     let paths = layout::locate_in(sel, profile)?;
     let secret = layout::read_identity_secret()?;
     let identity = crypto::parse_identity(&secret)?;
@@ -24,7 +36,11 @@ pub fn load_secrets_in(sel: &layout::StoreSelector, profile: &str) -> Result<Sec
             "no such profile '{profile}'. Create it with `envstow profile create {profile}`"
         )));
     }
-    let ciphertext = layout::read_store(&paths.store)?;
+    // One read serves both purposes: the bytes we decrypt ARE the version we'll check against.
+    // Reading twice would open a window where the file changes in between, leaving the version
+    // describing contents we never decrypted — a spurious conflict rather than a caught one.
+    let version = layout::StoreVersion::read(&paths.store)?;
+    let ciphertext = version.split_ciphertext(&paths.store)?;
 
     let mut text = crypto::decrypt_to_text(&ciphertext, &identity).map_err(|e| {
         AppError::msg(explain_decrypt_failure(
@@ -41,7 +57,7 @@ pub fn load_secrets_in(sel: &layout::StoreSelector, profile: &str) -> Result<Sec
         let decoded = crypto::decode_value(&v)?;
         vars.push((k, decoded));
     }
-    Ok(Secrets::from_pairs(vars))
+    Ok((Secrets::from_pairs(vars), version))
 }
 
 /// Turn age's `No matching keys found` into an error that says what to actually do.
@@ -128,7 +144,16 @@ fn is_committed_store(recipients_path: &Path) -> bool {
 
 /// Serialize `secrets` to dotenv, encrypt to the current recipients, and write the store.
 /// Zeroizes the plaintext payload buffer; the caller's `Secrets` scrubs its own values on drop.
-pub fn write_secrets(recipients_path: &Path, store: &Path, secrets: &Secrets) -> crate::Cmd {
+///
+/// `expected` is the store's state when this cycle read it (from [`load_secrets_versioned`]).
+/// If the file changed since, the write is refused rather than silently discarding whoever else
+/// wrote it. Pass `None` only when not modifying prior contents.
+pub fn write_secrets(
+    recipients_path: &Path,
+    store: &Path,
+    secrets: &Secrets,
+    expected: Option<&layout::StoreVersion>,
+) -> crate::Cmd {
     let recipients = layout::read_recipients(recipients_path).unwrap_or_default();
     if recipients.is_empty() {
         return Err(AppError::msg("no recipients — cannot encrypt."));
@@ -142,7 +167,7 @@ pub fn write_secrets(recipients_path: &Path, store: &Path, secrets: &Secrets) ->
     payload.zeroize();
     let ct = result?; // CryptoError -> "encryption failed: {e}"
 
-    layout::write_store(store, &ct)
+    layout::write_store(store, &ct, expected)
         .map_err(|e| AppError::msg(format!("could not write store: {e}")))
 }
 
@@ -151,7 +176,10 @@ pub fn write_secrets(recipients_path: &Path, store: &Path, secrets: &Secrets) ->
 pub fn reencrypt_store(store: &Path, recipients: &[Recipient]) -> crate::Cmd {
     let secret = layout::read_identity_secret()?;
     let identity = crypto::parse_identity(&secret)?;
-    let ciphertext = layout::read_store(store)?;
+    // Its own read-modify-write cycle, so it needs the same concurrency guard as `set`/`delete`:
+    // re-encrypting stale contents would drop whatever landed in between.
+    let version = layout::StoreVersion::read(store)?;
+    let ciphertext = version.split_ciphertext(store)?;
     let mut plaintext = crypto::decrypt(&ciphertext, &identity)?;
 
     let recips = match parse_all_recipients(recipients) {
@@ -165,7 +193,7 @@ pub fn reencrypt_store(store: &Path, recipients: &[Recipient]) -> crate::Cmd {
     plaintext.zeroize();
     let ct = result.map_err(|e| AppError::msg(format!("re-encryption failed: {e}")))?;
 
-    layout::write_store(store, &ct)
+    layout::write_store(store, &ct, Some(&version))
         .map_err(|e| AppError::msg(format!("could not write store: {e}")))?;
     eprintln!("re-encrypted store to {} recipient(s).", recips.len());
     Ok(())

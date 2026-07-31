@@ -343,6 +343,13 @@ pub enum LayoutError {
         from: PathBuf,
         name: Option<String>,
     },
+    /// The store changed on disk between this command reading it and writing it back —
+    /// completing the write would discard whatever the other writer put there.
+    StoreChangedUnderUs {
+        path: PathBuf,
+        /// The file is gone entirely, rather than merely different.
+        vanished: bool,
+    },
     /// `--store <name>` named a central store that doesn't exist.
     NoSuchStore {
         name: String,
@@ -461,6 +468,40 @@ impl std::fmt::Display for LayoutError {
             ),
             LayoutError::BadStoreName(n) => {
                 write!(f, "invalid store name '{n}' (use letters, digits, - or _)")
+            }
+            // Refusing costs the user one retype. Proceeding costs someone else their secret,
+            // with nothing to indicate it happened — so this errors rather than warns.
+            LayoutError::StoreChangedUnderUs { path, vanished } => {
+                if *vanished {
+                    write!(
+                        f,
+                        "the store was deleted while this command was running:\n\
+                         \x20   {}\n\
+                         \x20 Nothing was written. If that was a sync client mid-update, wait for \
+                         it to\n\
+                         \x20 settle and try again; if someone removed the store, get a current \
+                         copy first.",
+                        path.display()
+                    )
+                } else {
+                    write!(
+                        f,
+                        "someone else changed this store while your command was running, so \
+                         writing\n\
+                         \x20 now would silently discard their change:\n\
+                         \x20   {}\n\
+                         \n\
+                         \x20 Nothing was written — your change is the one that didn't happen. \
+                         Re-run the\n\
+                         \x20 same command and it will apply on top of theirs.\n\
+                         \x20 (Every envstow write rewrites the whole store, so \"last one wins\" \
+                         would\n\
+                         \x20  quietly drop a secret. Git refuses the equivalent push; a shared \
+                         folder\n\
+                         \x20  can't, so envstow checks.)",
+                        path.display()
+                    )
+                }
             }
         }
     }
@@ -677,23 +718,6 @@ pub fn read_recipients(path: &Path) -> Result<Vec<Recipient>, LayoutError> {
     Ok(parse_recipients(&text))
 }
 
-/// Read the encrypted store, verifying the format header and stripping it.
-///
-/// Returns the age ciphertext alone, so callers hand `crypto::decrypt` exactly what it expects.
-/// The format check runs BEFORE any crypto, so a store from a newer envstow fails with a clear
-/// "update your envstow" rather than a decryption error that reads like a permissions problem.
-pub fn read_store(path: &Path) -> Result<Vec<u8>, LayoutError> {
-    if !path.is_file() {
-        return Err(LayoutError::NoStore(path.to_path_buf()));
-    }
-    let bytes = fs::read(path).map_err(|e| LayoutError::Io(e.to_string()))?;
-    let (version, ciphertext) = split_format_header(&bytes)?;
-    if version > FORMAT_VERSION {
-        return Err(LayoutError::FormatTooNew { found: version });
-    }
-    Ok(ciphertext.to_vec())
-}
-
 /// Read just the format version of an existing store, without reading it as a store. Used by the
 /// write guard, which must inspect a file it may be about to refuse. A store that doesn't exist
 /// yet (init, `profile create`) has no format to conflict with.
@@ -706,15 +730,82 @@ fn store_format(path: &Path) -> Result<Option<u32>, LayoutError> {
     Ok(Some(version))
 }
 
+/// A fingerprint of the store file as it was read, carried through a read-modify-write cycle so
+/// the write can tell whether anyone else changed the file in between.
+///
+/// Every envstow write is read-modify-write: decrypt the whole store, change one key, re-encrypt
+/// the whole thing. Two people doing that at once against the same shared folder means the second
+/// write silently discards the first person's change — they had already decrypted the old
+/// contents before it existed. Git refuses the equivalent push and makes you pull; a synced folder
+/// has no such gate, so envstow provides one.
+///
+/// Content-based rather than mtime-based on purpose. Sync clients (Drive, Dropbox, Syncthing)
+/// rewrite files with timestamps that don't reflect edit order, some restore an older mtime
+/// wholesale, and coarse filesystem timestamp resolution can make two writes a second apart look
+/// identical. The bytes can't lie about whether the file changed.
+///
+/// `None` means the file did not exist when read — the write then requires it to still not exist,
+/// which is what makes two concurrent `init`s or `profile create`s safe.
+///
+/// Holds the ciphertext bytes themselves rather than a hash. A store is a few hundred bytes to a
+/// few kilobytes and is already read into memory twice on every write, so hashing would buy
+/// nothing but a dependency — and this crate deliberately keeps to three (see `cli`). The bytes
+/// are ciphertext, already public; this is a change detector, not a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreVersion(Option<Vec<u8>>);
+
+impl StoreVersion {
+    /// Fingerprint whatever is at `path` right now (absent counts, as `None`).
+    pub fn read(path: &Path) -> Result<StoreVersion, LayoutError> {
+        match fs::read(path) {
+            Ok(bytes) => Ok(StoreVersion(Some(bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoreVersion(None)),
+            Err(e) => Err(LayoutError::Io(e.to_string())),
+        }
+    }
+
+    /// The age ciphertext from the bytes this version captured, format header verified and
+    /// stripped — the same contract as [`read_store`], but without a second read of the file.
+    /// Lets a read-modify-write cycle decrypt exactly the bytes it will later check against.
+    pub fn split_ciphertext(&self, path: &Path) -> Result<Vec<u8>, LayoutError> {
+        let Some(bytes) = &self.0 else {
+            return Err(LayoutError::NoStore(path.to_path_buf()));
+        };
+        let (version, ciphertext) = split_format_header(bytes)?;
+        if version > FORMAT_VERSION {
+            return Err(LayoutError::FormatTooNew { found: version });
+        }
+        Ok(ciphertext.to_vec())
+    }
+}
+
 /// Write the encrypted store with this binary's format header, creating `.envstow/` if needed.
 ///
 /// Refuses to overwrite a store written in a NEWER format: an old binary re-encrypting a newer
 /// store would silently downgrade it and break every teammate who has already updated. The read
 /// guard alone can't catch this — by the time anyone reads it, the damage is committed.
-pub fn write_store(path: &Path, ciphertext: &[u8]) -> Result<(), LayoutError> {
+///
+/// `expected` is the fingerprint taken when this cycle read the store. If the file no longer
+/// matches, someone else wrote it in between and this write would silently drop their change, so
+/// it is refused. Pass `None` to skip the check — for writes that aren't modifying prior contents
+/// (creating a store from scratch), where there is nothing to lose.
+pub fn write_store(
+    path: &Path,
+    ciphertext: &[u8],
+    expected: Option<&StoreVersion>,
+) -> Result<(), LayoutError> {
     if let Some(found) = store_format(path)? {
         if found > FORMAT_VERSION {
             return Err(LayoutError::FormatWouldDowngrade { found });
+        }
+    }
+    if let Some(expected) = expected {
+        let current = StoreVersion::read(path)?;
+        if &current != expected {
+            return Err(LayoutError::StoreChangedUnderUs {
+                path: path.to_path_buf(),
+                vanished: current.0.is_none(),
+            });
         }
     }
     if let Some(parent) = path.parent() {
@@ -843,6 +934,100 @@ mod tests {
     }
 
     #[test]
+    fn a_write_is_refused_when_the_store_changed_since_it_was_read() {
+        // The shared-folder race: two people run `envstow set` at once. Both decrypt the same
+        // store; the second to write would re-encrypt contents that predate the first's change,
+        // silently dropping it. Git refuses the equivalent push — a synced folder can't, so the
+        // check lives here.
+        let dir = env::temp_dir().join(format!("envstow-cw-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("default.enc");
+
+        write_store(&store, b"age-encryption.org/v1\nfirst", None).unwrap();
+        // What our command read when it started.
+        let ours = StoreVersion::read(&store).unwrap();
+        // Someone else completes a write in the meantime.
+        write_store(&store, b"age-encryption.org/v1\ntheirs", None).unwrap();
+
+        let err = write_store(&store, b"age-encryption.org/v1\nours", Some(&ours)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LayoutError::StoreChangedUnderUs {
+                    vanished: false,
+                    ..
+                }
+            ),
+            "a changed store must refuse the write, got {err:?}"
+        );
+        assert_eq!(
+            fs::read(&store).unwrap(),
+            format!("{FORMAT_PREFIX}{FORMAT_VERSION}\nage-encryption.org/v1\ntheirs").into_bytes(),
+            "the refused write must leave THEIR change intact"
+        );
+
+        // Re-reading and retrying is the documented fix, and it must work.
+        let fresh = StoreVersion::read(&store).unwrap();
+        write_store(&store, b"age-encryption.org/v1\nmerged", Some(&fresh)).unwrap();
+
+        // A store that vanished mid-cycle is reported distinctly — "someone deleted it" needs
+        // different advice from "someone changed it".
+        let gone = dir.join("gone.enc");
+        write_store(&gone, b"age-encryption.org/v1\nx", None).unwrap();
+        let before = StoreVersion::read(&gone).unwrap();
+        fs::remove_file(&gone).unwrap();
+        let err = write_store(&gone, b"age-encryption.org/v1\ny", Some(&before)).unwrap_err();
+        assert!(
+            matches!(err, LayoutError::StoreChangedUnderUs { vanished: true, .. }),
+            "a deleted store is its own case, got {err:?}"
+        );
+
+        // Creating from scratch: the guard requires it to still be absent, so two concurrent
+        // `init`s can't have the second silently clobber the first.
+        let fresh_path = dir.join("new.enc");
+        let absent = StoreVersion::read(&fresh_path).unwrap();
+        write_store(&fresh_path, b"age-encryption.org/v1\na", None).unwrap();
+        let err = write_store(&fresh_path, b"age-encryption.org/v1\nb", Some(&absent)).unwrap_err();
+        assert!(
+            matches!(err, LayoutError::StoreChangedUnderUs { .. }),
+            "an expected-absent store that now exists must refuse, got {err:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_conflict_message_says_nothing_was_written_and_what_to_do() {
+        // Someone hitting this is mid-task and needs two facts fast: their change did NOT land,
+        // and re-running is the fix. Anything vaguer invites a destructive workaround.
+        let changed = LayoutError::StoreChangedUnderUs {
+            path: PathBuf::from("/shared/default.enc"),
+            vanished: false,
+        }
+        .to_string();
+        assert!(
+            changed.contains("Nothing was written"),
+            "must say their change didn't land: {changed}"
+        );
+        assert!(changed.contains("Re-run"), "must give the fix: {changed}");
+        assert!(
+            changed.contains("/shared/default.enc"),
+            "must name the store: {changed}"
+        );
+
+        let vanished = LayoutError::StoreChangedUnderUs {
+            path: PathBuf::from("/shared/default.enc"),
+            vanished: true,
+        }
+        .to_string();
+        assert!(
+            vanished.contains("deleted"),
+            "a vanished store gets its own explanation: {vanished}"
+        );
+    }
+
+    #[test]
     fn write_store_refuses_to_downgrade_a_newer_store() {
         // No CLI path reaches this today — set/delete both decrypt first, so the READ guard
         // fires before this one. It's a backstop: it makes downgrade-safety a property of the
@@ -853,7 +1038,7 @@ mod tests {
         let store = dir.join("future.enc");
         fs::write(&store, b"envstow-format: 42\nage-encryption.org/v1\n").unwrap();
 
-        let err = write_store(&store, b"age-encryption.org/v1\nnew").unwrap_err();
+        let err = write_store(&store, b"age-encryption.org/v1\nnew", None).unwrap_err();
         assert!(
             matches!(err, LayoutError::FormatWouldDowngrade { found: 42 }),
             "should refuse, got {err:?}"
@@ -867,7 +1052,7 @@ mod tests {
         // A store at our own format is fine to overwrite, and gets the header back.
         let ours = dir.join("ours.enc");
         fs::write(&ours, format!("{FORMAT_PREFIX}{FORMAT_VERSION}\nold")).unwrap();
-        write_store(&ours, b"age-encryption.org/v1\nnew").unwrap();
+        write_store(&ours, b"age-encryption.org/v1\nnew", None).unwrap();
         assert_eq!(
             fs::read(&ours).unwrap(),
             format!("{FORMAT_PREFIX}{FORMAT_VERSION}\nage-encryption.org/v1\nnew").into_bytes()

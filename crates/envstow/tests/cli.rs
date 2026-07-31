@@ -2060,3 +2060,71 @@ fn an_unreadable_pointer_still_gets_advice_without_inventing_a_name() {
         out.stderr
     );
 }
+
+#[test]
+fn concurrent_writers_leave_the_store_consistent() {
+    // The shared-folder hazard at the real CLI: `reencrypt` and `set` overlap, both having
+    // decrypted the same store. Whoever writes second would re-encrypt contents that predate the
+    // other's change, dropping a secret with no error. Git refuses the equivalent push; a synced
+    // folder can't, so envstow checks.
+    //
+    // Two processes on a fast machine often DON'T overlap, so this can't assert that the guard
+    // fires — it asserts the properties that must hold either way: the store stays readable, no
+    // secret is lost, and IF a write was refused it said so usefully and a retry works. The
+    // guard's actual mechanics are pinned by the layout unit tests, which are deterministic.
+    let repo = Repo::new("race-cli");
+    assert_eq!(repo.run(&["init", "--no-skill"], "").code, 0);
+    assert_eq!(repo.run(&["set", "KEEP"], "v1").code, 0);
+
+    let mut reenc = Command::new(BIN);
+    reenc
+        .args(["reencrypt"])
+        .current_dir(&repo.dir)
+        .env("ENVSTOW_IDENTITY", &repo.identity)
+        .env("XDG_CONFIG_HOME", &repo.config)
+        .env("APPDATA", &repo.config)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    clear_agent_markers(&mut reenc);
+    let spawned = reenc.spawn().expect("spawn reencrypt");
+    let setter = repo.run(&["set", "RACER"], "v2");
+    let reenc_out = spawned.wait_with_output().expect("wait reencrypt");
+
+    let set_ok = setter.code == 0;
+    let reenc_ok = reenc_out.status.success();
+    let reenc_err = String::from_utf8_lossy(&reenc_out.stderr).into_owned();
+
+    // Whichever lost must have said so clearly rather than failing obscurely.
+    if !set_ok {
+        assert!(
+            setter.stderr.contains("Nothing was written") && setter.stderr.contains("Re-run"),
+            "the refused `set` must say the change didn't land, and how to fix it: {}",
+            setter.stderr
+        );
+    }
+    if !reenc_ok {
+        assert!(
+            reenc_err.contains("Nothing was written") || reenc_err.contains("changed"),
+            "the refused `reencrypt` must explain itself: {reenc_err}"
+        );
+    }
+
+    // Whatever the interleaving, the store is intact and readable — never half-written.
+    let listed = repo.run(&["list"], "");
+    assert_eq!(
+        listed.code, 0,
+        "the store must stay readable after a race: {}",
+        listed.stderr
+    );
+    assert!(
+        listed.stdout.contains("KEEP"),
+        "the pre-existing secret survives either outcome: {}",
+        listed.stdout
+    );
+
+    // And a refused write is recoverable by simply re-running it.
+    if !set_ok {
+        assert_eq!(repo.run(&["set", "RACER"], "v2").code, 0, "retry must work");
+        assert!(repo.run(&["list"], "").stdout.contains("RACER"));
+    }
+}

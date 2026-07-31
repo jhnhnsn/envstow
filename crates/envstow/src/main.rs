@@ -298,7 +298,7 @@ fn cmd_set(args: &[String]) -> Cmd {
             return Err(e.into());
         }
     };
-    let mut secrets = match load_secrets_in(&sel, &profile) {
+    let (mut secrets, version) = match store::load_secrets_versioned(&sel, &profile) {
         Ok(v) => v,
         Err(e) => {
             value.zeroize();
@@ -333,7 +333,7 @@ fn cmd_set(args: &[String]) -> Cmd {
     // in, so nothing left here to zeroize; `secrets` scrubs everything on drop.
     secrets.upsert(name, value);
 
-    if let Err(e) = write_secrets(&paths.recipients, &paths.store, &secrets) {
+    if let Err(e) = write_secrets(&paths.recipients, &paths.store, &secrets, Some(&version)) {
         if let Some(mut line) = export_line {
             line.zeroize();
         }
@@ -437,7 +437,7 @@ fn cmd_delete(args: &[String]) -> Cmd {
     };
 
     let paths = layout::locate_in(&sel, &profile)?;
-    let mut secrets = load_secrets_in(&sel, &profile)?;
+    let (mut secrets, version) = store::load_secrets_versioned(&sel, &profile)?;
 
     if !secrets.contains(name) {
         return Err(AppError::msg(format!("no secret named '{name}'")));
@@ -460,7 +460,7 @@ fn cmd_delete(args: &[String]) -> Cmd {
     // Drop the entry (its value is zeroized as it leaves the store).
     secrets.remove(name);
 
-    write_secrets(&paths.recipients, &paths.store, &secrets)?;
+    write_secrets(&paths.recipients, &paths.store, &secrets, Some(&version))?;
     eprintln!("deleted {name}");
     eprintln!(
         "\n⚠️  Deleting only removes it going forward. The value is still readable in this\n\
@@ -629,7 +629,8 @@ fn cmd_init(args: &[String]) -> Cmd {
         let seed = b"# envstow secrets -- KEY=value lines. Edit via `envstow unlock`.\n";
         match encrypt_payload(seed, &recipients) {
             Ok(ct) => {
-                if let Err(e) = layout::write_store(&store_path, &ct) {
+                let absent = layout::StoreVersion::read(&store_path)?;
+                if let Err(e) = layout::write_store(&store_path, &ct, Some(&absent)) {
                     return Err(AppError::msg(format!("could not write store: {e}")));
                 }
                 eprintln!("created empty store at {}", store_path.display());
@@ -960,7 +961,8 @@ fn profile_create(name: &str) -> Cmd {
     let seed = format!("# envstow profile '{name}' -- KEY=value lines.\n");
     let ct = encrypt_payload(seed.as_bytes(), &recipients)
         .map_err(|e| AppError::msg(format!("could not create profile store: {e}")))?;
-    layout::write_store(&paths.store, &ct)
+    let absent = layout::StoreVersion::read(&paths.store)?;
+    layout::write_store(&paths.store, &ct, Some(&absent))
         .map_err(|e| AppError::msg(format!("could not write store: {e}")))?;
     eprintln!("created profile '{name}' at {}", paths.store.display());
     eprintln!(
