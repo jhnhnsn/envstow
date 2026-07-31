@@ -638,15 +638,27 @@ arise. See [DESIGN.md](DESIGN.md#where-the-store-lives) for the full reasoning.
 
 **Running `init` in a repo that already carries a pointer** — the natural reflex after cloning —
 refuses rather than clobber it, since the pointer may name the only copy of someone's secrets.
-What it tells you next depends on whether you have that store:
 
-| | What `init` says |
-|---|---|
-| You have the store | Nothing to initialize — `envstow set <NAME>` |
-| You don't (a fresh clone) | `envstow init --store <name>` for the steps to join |
-| Pointer is unreadable | Says so; check `envstow store` |
+The same situation has three legitimate resolutions and envstow can't tell which you meant, so
+rather than state the problem and stop, it lists them with the likeliest first:
 
-Genuinely want a local store here instead? Delete the pointer file first.
+```
+$ envstow init
+envstow: /my-project/.envstow is a FILE, so it points at a store kept elsewhere —
+  it isn't a local store directory, and there's nothing here to initialize.
+
+   If you're trying to JOIN this project's secrets (most likely — you cloned it):
+     envstow init --store acme
+   If you're trying to START A SEPARATE store, unrelated to 'acme':
+     envstow init --store <another-name>
+   If you're trying to KEEP SECRETS IN THIS REPO instead — delete the pointer file,
+   then re-run (this repo stops using 'acme'):
+     rm /my-project/.envstow && envstow init
+```
+
+Once you *have* the store, the first branch becomes `envstow set <NAME>` instead — there's
+genuinely nothing left to initialize. The dangling-pointer error (which any command hits, not
+just `init`) is laid out the same way.
 
 ### Moving an existing store
 

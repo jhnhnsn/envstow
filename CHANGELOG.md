@@ -14,6 +14,15 @@ All notable changes to envstow are documented here. Versions follow [SemVer](htt
   to join when it isn't, and a plain "that file isn't a readable pointer" when it can't be
   parsed. All three still name the escape hatch (delete the pointer for a local store).
 
+### Changed
+- **Store errors route by intent rather than stating a fact and stopping.** Each now lists the
+  things you might have been trying to do and the command for each — "If you're trying to JOIN
+  this project's secrets… / to START A SEPARATE store… / to KEEP SECRETS IN THIS REPO instead…"
+  — with the likeliest first. A bare statement of what's wrong reads as a dead end when the same
+  situation has three legitimate resolutions and the tool can't tell which you meant. Applies to
+  the pointer-collision error, the fork guard, and the dangling-pointer error (the one a new
+  collaborator meets first, from any command).
+
 ## 0.2.1
 
 ### Fixed

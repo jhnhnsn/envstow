@@ -459,18 +459,29 @@ impl std::fmt::Display for LayoutError {
                  \x20  (A `{ENVSTOW_DIR}` DIRECTORY holds a store directly; a FILE points at a \
                  central one.)"
             ),
+            // The error a new collaborator meets first — any command hits it, not just `init`.
+            // "Create it" alone is a trap: for the likeliest reader (just cloned, wants the
+            // team's secrets) creating an empty store is exactly the wrong move, so each intent
+            // gets named and pointed at its own command.
             LayoutError::PointerDangling {
                 name,
                 from,
                 expected,
             } => write!(
                 f,
-                "{} points at the central store '{name}', which isn't on this machine.\n\
-                 \x20  Expected it at: {}\n\
-                 \x20  Create it with `envstow init --store {name}`, or get a copy from \
-                 whoever shares it with you.",
+                "{} says this project's secrets live in the central store '{name}',\n\
+                 \x20 but that store isn't on this machine (looked in {}).\n\
+                 \n\
+                 \x20  If you're trying to GET THIS PROJECT'S SECRETS (most likely — you \
+                 cloned it):\n\
+                 \x20    envstow init --store {name}   …prints the steps to join\n\
+                 \x20  If you're trying to USE A DIFFERENT STORE you already have:\n\
+                 \x20    envstow store   …lists them\n\
+                 \x20  If this project's secrets should live IN THE REPO instead:\n\
+                 \x20    rm {} && envstow init",
                 from.display(),
-                expected.display()
+                expected.display(),
+                from.display()
             ),
             LayoutError::NoSuchStore { name, known } => {
                 write!(f, "no central store named '{name}'.")?;
@@ -999,6 +1010,12 @@ mod tests {
         .to_string();
         assert!(dangling.contains("acme"), "names the store");
         assert!(dangling.contains("/repo/.envstow"), "names the pointer");
+        // This is the first error a new collaborator meets, from ANY command — so it routes by
+        // what they were trying to do rather than stating the problem and stopping.
+        assert!(
+            dangling.matches("If you're trying to").count() >= 2,
+            "must offer more than one intent: {dangling}"
+        );
         assert!(
             dangling.contains("envstow init --store acme"),
             "tells them how to create it: {dangling}"

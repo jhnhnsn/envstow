@@ -2117,6 +2117,13 @@ fn init_refuses_to_fork_a_store_this_repo_already_points_at() {
         err.contains("add-recipient"),
         "must show how to actually join: {err}"
     );
+    // Refusing is only half the job — the message routes by what the user was trying to do,
+    // since `init --store` here could equally mean "join", "start a separate store", or "I
+    // want secrets in the repo after all".
+    assert!(
+        err.matches("If you're trying to").count() >= 2,
+        "must name the alternative intents too, not just the likeliest: {err}"
+    );
     assert!(
         !other_cfg.join("envstow/stores/acme/default.enc").is_file(),
         "the divergent store must NOT have been created"
@@ -2162,8 +2169,20 @@ fn plain_init_over_a_pointer_advises_by_whether_the_store_is_here() {
         absent.stderr
     );
     assert!(
-        !absent.stderr.contains("Add secrets with"),
+        !absent.stderr.contains("envstow set"),
         "must NOT suggest `set`, which cannot work without the store: {}",
+        absent.stderr
+    );
+    // Each branch is written as "if you're trying to X, do Y" so the reader picks their intent
+    // instead of decoding a bare statement of fact.
+    assert!(
+        absent.stderr.matches("If you're trying to").count() >= 2,
+        "must offer the alternative intents, not just the likeliest one: {}",
+        absent.stderr
+    );
+    assert!(
+        absent.stderr.contains("rm ") && absent.stderr.contains("&& envstow init"),
+        "must spell out the local-store escape hatch as a runnable command: {}",
         absent.stderr
     );
 
@@ -2193,8 +2212,13 @@ fn plain_init_over_a_pointer_advises_by_whether_the_store_is_here() {
     let bad = repo.run(&["init", "--no-skill"], "");
     assert_ne!(bad.code, 0);
     assert!(
-        bad.stderr.contains("isn't a readable pointer"),
+        bad.stderr.contains("unreadable as a pointer"),
         "must say the file is unreadable rather than invent a name: {}",
+        bad.stderr
+    );
+    assert!(
+        !bad.stderr.contains("--store "),
+        "must not guess a store name it couldn't parse: {}",
         bad.stderr
     );
 

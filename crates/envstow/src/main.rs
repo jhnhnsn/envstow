@@ -563,29 +563,60 @@ fn cmd_init(args: &[String]) -> Cmd {
         let named = std::fs::read_to_string(&store_root)
             .ok()
             .and_then(|t| layout::parse_pointer_name(&t));
-        let next_step = match &named {
-            // The store is here: this repo is already set up, so there is nothing to init.
+        // `init` here could mean any of three different things, and the file alone doesn't say
+        // which. Rather than guess and be wrong for two of them, name each intent and give it
+        // its command — the reader picks the line that matches what they were trying to do.
+        let goals = match &named {
             Some(n)
                 if layout::central_store_path(n)
                     .join(layout::RECIPIENTS_NAME)
                     .is_file() =>
             {
-                "This repo already uses that store, and you have it — there's nothing to \
-                 initialize.\n\x20  Add secrets with `envstow set <NAME>`."
-                    .to_string()
+                format!(
+                    "\x20  If you're trying to ADD A SECRET — you're already set up, nothing to \
+                     initialize:\n\
+                     \x20    envstow set <NAME>\n\
+                     \x20  If you're trying to SEE WHERE SECRETS LIVE:\n\
+                     \x20    envstow store\n\
+                     \x20  If you're trying to KEEP SECRETS IN THIS REPO instead of the '{n}' \
+                     store — delete\n\
+                     \x20  the pointer file, then re-run (this repo stops using '{n}'):\n\
+                     \x20    rm {} && envstow init",
+                    store_root.display()
+                )
             }
-            // Named, but absent — you're joining. Send them to the one command that helps.
             Some(n) => format!(
-                "You don't have that store yet, so `envstow set` won't work either.\n\
-                 \x20  Run `envstow init --store {n}` for the steps to join it."
+                "\x20  If you're trying to JOIN this project's secrets (most likely — you \
+                 cloned it):\n\
+                 \x20    envstow init --store {n}\n\
+                 \x20  If you're trying to START A SEPARATE store, unrelated to '{n}':\n\
+                 \x20    envstow init --store <another-name>\n\
+                 \x20  If you're trying to KEEP SECRETS IN THIS REPO instead — delete the \
+                 pointer file,\n\
+                 \x20  then re-run (this repo stops using '{n}'):\n\
+                 \x20    rm {} && envstow init",
+                store_root.display()
             ),
-            // Unreadable pointer: don't guess a store name, just say what's wrong.
-            None => "That file isn't a readable pointer — see `envstow store`.".to_string(),
+            // Unreadable pointer: don't guess a store name — it may be a typo in a file someone
+            // committed, and inventing one would send them to the wrong store.
+            None => format!(
+                "\x20  The file is unreadable as a pointer, so envstow can't tell which store \
+                 it meant.\n\
+                 \x20  If you're trying to FIX IT — a pointer is one line, `store: <name>`:\n\
+                 \x20    envstow store          (shows what envstow makes of it)\n\
+                 \x20  If you're trying to KEEP SECRETS IN THIS REPO — replace it with a store:\n\
+                 \x20    rm {} && envstow init",
+                store_root.display()
+            ),
         };
+        // The header states only what's true in every branch: `.envstow` here is a FILE, and a
+        // file is a pointer to a store elsewhere — never a store itself. Whether it names a
+        // readable one is the branches' business.
         return Err(AppError::msg(format!(
-            "{} is a pointer FILE naming a central store, not a local store directory.\n\
-             \x20  {next_step}\n\
-             \x20  (Really want a local store here instead? Delete the pointer file first.)",
+            "{} is a FILE, so it points at a store kept elsewhere —\n\
+             \x20 it isn't a local store directory, and there's nothing here to initialize.\n\
+             \n\
+             {goals}",
             store_root.display()
         )));
     }
@@ -613,21 +644,27 @@ fn cmd_init(args: &[String]) -> Cmd {
             return Err(AppError::msg(format!(
                 "this project already points at the central store '{name}', but you don't have \
                  it yet.\n\
-                 \x20  Creating it here would make a SECOND, empty store with the same name — \
-                 not a copy\n\
-                 \x20  of your colleague's — and nothing would warn you they'd diverged.\n\
+                 \x20 Creating it here would make a SECOND, empty store with the same name — \
+                 not a copy of\n\
+                 \x20 your colleague's — and nothing would warn you they'd diverged.\n\
                  \n\
-                 \x20  To join, send them your public key:\n\
-                 \x20    {public}\n\
-                 \x20  They run:  envstow add-recipient {public} <your-name>\n\
-                 \x20  …then send you their store directory (they can find it with \
-                 `envstow store`).\n\
-                 \x20  It goes here:\n\
-                 \x20    {}\n\
+                 \x20  If you're trying to JOIN '{name}' (most likely), three steps:\n\
+                 \x20    1. Send whoever has it your public key:\n\
+                 \x20         {public}\n\
+                 \x20    2. They run:  envstow add-recipient {public} <your-name>\n\
+                 \x20    3. They send you their store directory (`envstow store` shows them \
+                 where it is);\n\
+                 \x20       you put it at:\n\
+                 \x20         {}\n\
+                 \x20    Then `envstow list` works here.\n\
                  \n\
-                 \x20  (Starting an unrelated store that happens to share the name? Use a \
-                 different\n\
-                 \x20   name, or delete {} first.)",
+                 \x20  If you're trying to START A SEPARATE store that just happens to share \
+                 the name:\n\
+                 \x20    envstow init --store <another-name>\n\
+                 \x20  If you're trying to KEEP SECRETS IN THIS REPO instead — delete the \
+                 pointer file,\n\
+                 \x20  then re-run (this repo stops using '{name}'):\n\
+                 \x20    rm {} && envstow init",
                 store_root.display(),
                 pointer.display()
             )));
