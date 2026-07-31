@@ -30,3 +30,4 @@ crates/envstow/target/
 # OS / editor cruft
 .DS_Store
 *.swp
+.envrc
