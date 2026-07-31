@@ -7,6 +7,9 @@ command line.
 - **Works solo, offline, no git.** A folder with `.envstow/` in it is all you need.
 - **Share it by committing it**, if you want to. The store is encrypted to each collaborator's
   age public key, so it's safe in a repo. Everyone decrypts with their own private key.
+- **Or keep it out of the repo** — in your config dir, or a synced folder — reached by
+  `--store <name>` / `--store-dir <path>`. Nothing committed can change which store a project
+  uses, so a `git pull` can never swap your secrets underneath you. See [Stores](#stores).
 - **Self-contained:** one Rust binary. All crypto is the [`age`](https://crates.io/crates/age)
   crate (X25519 + ChaCha20-Poly1305) compiled in — **no `sops`, no `age` CLI, nothing else to
   install.**
@@ -64,9 +67,9 @@ That's the whole loop. The public key is safe to share; the value never leaves a
 or a child process. Full walkthrough and the reasoning behind each step:
 **[ONBOARDING.md](./ONBOARDING.md)**.
 
-Don't want the store committed — a public repo, or collaborators with no git remote? Swap the
-first step for `envstow init --store <name>` and the store lives outside the repo entirely; see
-**[Stores](#stores)**.
+Don't want the store committed? `envstow init --store <name>` keeps it outside the repo entirely
+— at the cost of naming it on every command, and of sharing it yourself, since git no longer
+carries it. See **[Stores](#stores)**.
 
 ---
 
@@ -377,15 +380,46 @@ Point `$ENVSTOW_IDENTITY` at a dedicated CI key (added as a recipient, stored as
 ENVSTOW_IDENTITY=/path/to/ci-key envstow run -- npm run deploy
 ```
 
-That's the whole setup when the store is committed — the checkout brings it along. With a
-**central store** the runner has no copy, so put the store where the job can reach it and point
-at it by path:
+That's the whole setup when the store is committed — the checkout brings it along. If the store
+lives **outside** the repo, the runner has no copy, so put it where the job can reach it and name
+it explicitly:
 
 ```bash
 ENVSTOW_IDENTITY=/path/to/ci-key \
 ENVSTOW_STORE_DIR=/path/to/store \
   envstow run -- npm run deploy
 ```
+
+### 9. Keeping the store out of the repo
+
+Sometimes committing the store is the wrong call:
+
+- **A public repo.** The store is ciphertext, so publishing it isn't a plaintext leak — but it is
+  a permanent, world-downloadable copy, and `recipients` publicly lists your collaborators.
+- **Secrets you use across projects.** One personal store, many repos, no duplication.
+- **No git, or a team that shares a folder** over Drive/Dropbox/Syncthing instead.
+
+```bash
+envstow init --store personal          # → ~/.config/envstow/stores/personal/
+envstow --store personal set OPENAI_API_KEY
+envstow --store personal run -- ./script.sh
+export ENVSTOW_STORE=personal          # …or set it once per shell
+```
+
+Nothing is written into the working directory, so **nothing in a checkout can select this
+store** — that's deliberate (see [Stores](#stores)). The trade is that you name it every time,
+or export it; forget, and envstow falls back to looking for `.envstow/` as usual.
+
+For a folder your team already syncs, use a path instead — everyone points at their own synced
+copy and the sync service handles delivery:
+
+```bash
+envstow init --store-dir ~/"Drive/team-secrets"
+export ENVSTOW_STORE_DIR=~/"Drive/team-secrets"
+```
+
+Sharing a store that *isn't* synced is manual: `add-recipient` their key, then send them the
+directory. envstow won't arrange that for you — see [Sharing one](#sharing-one).
 
 ### On Windows
 
