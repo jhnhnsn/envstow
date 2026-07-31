@@ -32,7 +32,7 @@
 
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use zeroize::Zeroize;
@@ -736,6 +736,10 @@ fn cmd_init(args: &[String]) -> Cmd {
     //    flag and no exported variable. Without it, every command here would need `--store`, and
     //    forgetting would fall through to the walk — which for a public repo means quietly
     //    finding some OTHER store, the exact outcome this setup exists to prevent.
+    // Set when we created a store but this directory still points somewhere else — the store
+    // exists and is fine, but commands run *here* won't reach it. Reported at the end instead of
+    // the usual "Ready", which would be false.
+    let mut pointer_conflict: Option<(String, PathBuf)> = None;
     if let layout::StoreSelector::Named(name) = &sel {
         let pointer = cwd.join(layout::ENVSTOW_DIR);
         if pointer.is_dir() {
@@ -745,7 +749,19 @@ fn cmd_init(args: &[String]) -> Cmd {
                 pointer.display()
             );
         } else if pointer.is_file() {
-            eprintln!("pointer already exists at {}", pointer.display());
+            // A pointer naming a DIFFERENT store is the case that bites: we just built '{name}',
+            // but this directory still resolves to whatever the pointer says, so every command
+            // here keeps failing (or worse, silently uses the other store). Saying "pointer
+            // already exists" and then "Ready" would be two lies in a row.
+            let existing = std::fs::read_to_string(&pointer)
+                .ok()
+                .and_then(|t| layout::parse_pointer_name(&t));
+            match existing {
+                Some(other) if &other != name => {
+                    pointer_conflict = Some((other, pointer.clone()));
+                }
+                _ => eprintln!("pointer already exists at {}", pointer.display()),
+            }
         } else if let Err(e) = std::fs::write(&pointer, layout::render_pointer(name)) {
             return Err(AppError::msg(format!("could not write pointer file: {e}")));
         } else {
@@ -766,7 +782,27 @@ fn cmd_init(args: &[String]) -> Cmd {
     // whose store belongs to other people is NOT ready — they're waiting on a recipient. Saying
     // otherwise (right after two green checkmarks) is what makes the later "No matching keys"
     // look like a bug rather than the expected next step.
-    if joining_existing {
+    if let Some((other, pointer)) = &pointer_conflict {
+        let created = match &sel {
+            layout::StoreSelector::Named(n) => n.clone(),
+            _ => layout::DEFAULT_PROFILE.to_string(),
+        };
+        eprintln!(
+            "\n⚠️  The store '{created}' is ready, but THIS directory still points at '{other}'\n\
+             \x20  ({}), so commands run here won't reach '{created}'.\n\
+             \n\
+             \x20  If you're trying to USE '{created}' HERE — repoint this project at it:\n\
+             \x20    printf 'store: {created}\\n' > {}\n\
+             \x20  If you're trying to USE '{created}' SOMEWHERE ELSE — nothing more to do here; \
+             run\n\
+             \x20  `envstow init --store {created}` in that project, or use \
+             `--store {created}` per command.\n\
+             \x20  If you meant to get '{other}' working instead:\n\
+             \x20    envstow init --store {other}",
+            pointer.display(),
+            pointer.display()
+        );
+    } else if joining_existing {
         eprintln!(
             "\n⏳ Almost there — you can't decrypt this store yet. Send your public key to \
              someone\n\

@@ -14,6 +14,14 @@ All notable changes to envstow are documented here. Versions follow [SemVer](htt
   to join when it isn't, and a plain "that file isn't a readable pointer" when it can't be
   parsed. All three still name the escape hatch (delete the pointer for a local store).
 
+- **`init --store <name>` no longer reports "Ready" when this directory points somewhere else.**
+  Creating a store beside a pointer naming a *different* one printed a bland "pointer already
+  exists" and then declared success — but the directory still resolved to the other store, so
+  every following command failed. Worse, that was the exact outcome of following the "start a
+  separate store" advice: do as told, get told it worked, find nothing works. It now names the
+  store that's actually in effect and gives the one-line command to repoint the project — and
+  still never rewrites the pointer itself, since which store a project uses is the user's call.
+
 ### Changed
 - **Store errors route by intent rather than stating a fact and stopping.** Each now lists the
   things you might have been trying to do and the command for each — "If you're trying to JOIN

@@ -2231,3 +2231,46 @@ fn plain_init_over_a_pointer_advises_by_whether_the_store_is_here() {
     );
     assert!(repo.entry().is_dir(), "…and that store is a directory");
 }
+
+#[test]
+fn creating_a_store_beside_a_pointer_to_another_does_not_claim_ready() {
+    // Following the "START A SEPARATE store" advice used to end in "Ready" while the directory
+    // still resolved to the OTHER store — the user does exactly what they were told, is told it
+    // worked, and every subsequent command fails. Creating the store is right; claiming the
+    // repo is usable is not.
+    let repo = Repo::new("ptr-conflict");
+    std::fs::write(repo.entry(), "store: acme\n").unwrap();
+
+    let out = repo.run(&["init", "--store", "other", "--no-skill"], "");
+    assert_eq!(out.code, 0, "creating a differently-named store is allowed");
+    assert!(
+        repo.central_store("other").join("default.enc").is_file(),
+        "the store itself must still be created"
+    );
+    assert!(
+        !out.stderr.contains("Ready."),
+        "must NOT claim ready — this directory still points at 'acme': {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("still points at 'acme'"),
+        "must say which store the directory actually resolves to: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("store: other"),
+        "must give the command that repoints this project: {}",
+        out.stderr
+    );
+    // The pointer is NOT rewritten behind the user's back — repointing is their call.
+    assert_eq!(
+        std::fs::read_to_string(repo.entry()).unwrap().trim(),
+        "store: acme",
+        "init must not silently repoint the project"
+    );
+
+    // And the suggested fix genuinely works.
+    std::fs::write(repo.entry(), "store: other\n").unwrap();
+    assert_eq!(repo.run(&["set", "K"], "v").code, 0);
+    assert!(repo.run(&["list"], "").stdout.contains('K'));
+}
