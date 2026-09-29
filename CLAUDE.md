@@ -48,6 +48,8 @@ identically either way.)
   with `--clipboard`. Both keep the value off the command line.
 - `envstow delete <NAME>` — remove one secret and re-encrypt (`--force` to skip the prompt).
 - `envstow list` — list secret **names** (never values).
+- `envstow list-recipients` — list collaborators' public keys and flag any profile not yet
+  re-encrypted to them. Safe (public keys only).
 - `envstow store` — show which store is in effect and why; list central stores. Safe (paths and
   names only).
 - After any store change (`set`/`delete`) made **inside** an unlocked shell, the running

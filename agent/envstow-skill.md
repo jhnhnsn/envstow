@@ -175,6 +175,9 @@ Adding a person is a two-sided key exchange. Walk the human through it:
    ```
 3. The new teammate pulls; they can now decrypt with their own key.
 
+`envstow list-recipients` shows who's on the store (public keys only — safe to run) and flags any
+profile that wasn't re-encrypted to the current list, with the exact `reencrypt` to run.
+
 Prefer having the teammate add their own key line via a **pull request** — the key is in the
 diff, tied to their identity, and recorded in history.
 

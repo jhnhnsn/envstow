@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto;
 use crate::error::AppError;
@@ -196,6 +196,77 @@ pub fn reencrypt_store(store: &Path, recipients: &[Recipient]) -> crate::Cmd {
     layout::write_store(store, &ct, Some(&version))
         .map_err(|e| AppError::msg(format!("could not write store: {e}")))?;
     eprintln!("re-encrypted store to {} recipient(s).", recips.len());
+    Ok(())
+}
+
+/// Change the recipient set: write `recipients` to `recipients_path` and re-encrypt EVERY profile
+/// under `root` to it. Used by add/remove-recipient — all profiles share the one recipients file,
+/// so re-encrypting only the current one would leave an added collaborator locked out of the
+/// rest, and a removed one still able to read them.
+///
+/// Every profile is decrypted before anything is written. If any can't be (you aren't one of its
+/// recipients, it's corrupt, a newer format), nothing changes: for a removal, carrying on would
+/// report success while the removed key still opens that profile. Plaintexts are zeroized.
+pub fn change_recipients(
+    root: &Path,
+    recipients_path: &Path,
+    recipients: &[Recipient],
+) -> crate::Cmd {
+    let recips = parse_all_recipients(recipients)?;
+    let secret = layout::read_identity_secret()?;
+    let identity = crypto::parse_identity(&secret)?;
+
+    let mut opened = Vec::new();
+    for profile in layout::list_profiles(root) {
+        let store = root.join(format!("{profile}.enc"));
+        let version = layout::StoreVersion::read(&store)?;
+        let plaintext = version
+            .split_ciphertext(&store)
+            .map_err(AppError::from)
+            .and_then(|ct| crypto::decrypt(&ct, &identity).map_err(AppError::from))
+            .map_err(|e| {
+                AppError::msg(format!(
+                    "can't decrypt profile '{profile}' ({e}), so it can't be re-encrypted to the \
+                     new recipients.\n  Nothing was changed. Every profile shares the recipients \
+                     file, so a recipient change needs a key that opens all of them."
+                ))
+            })?;
+        opened.push((profile, store, version, Zeroizing::new(plaintext)));
+    }
+
+    std::fs::write(recipients_path, layout::render_recipients(recipients))
+        .map_err(|e| AppError::msg(format!("could not update recipients file: {e}")))?;
+
+    // Past the point of no return: the recipients file is written. Carry on through every
+    // profile rather than stopping at the first failure, and name exactly what's left to fix.
+    let mut done = Vec::new();
+    let mut failed = Vec::new();
+    for (profile, store, version, plaintext) in &opened {
+        let result = crypto::encrypt(plaintext, &recips)
+            .map_err(|e| e.to_string())
+            .and_then(|ct| {
+                layout::write_store(store, &ct, Some(version)).map_err(|e| e.to_string())
+            });
+        match result {
+            Ok(()) => done.push(profile.as_str()),
+            Err(e) => failed.push(format!(
+                "  {profile}: {e}\n    fix: envstow --profile {profile} reencrypt"
+            )),
+        }
+    }
+    if !done.is_empty() {
+        eprintln!(
+            "re-encrypted {} to {} recipient(s).",
+            done.join(", "),
+            recips.len()
+        );
+    }
+    if !failed.is_empty() {
+        return Err(AppError::msg(format!(
+            "recipients file updated, but these profiles were NOT re-encrypted:\n{}",
+            failed.join("\n")
+        )));
+    }
     Ok(())
 }
 

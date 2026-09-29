@@ -358,6 +358,9 @@ git add .envstow && git commit -m "Add Alice" && git push
 > If Alice runs `envstow init` *inside* the project, it appends her key to `recipients` but she
 > still can't decrypt. envstow tells her so, and the fix is for you to run `envstow reencrypt`
 > (not `add-recipient` — her key is already listed). Avoid the detour: have her `init` elsewhere.
+>
+> `envstow list-recipients` shows who's listed **and** checks each profile against that list,
+> naming any that needs a `reencrypt`.
 
 Only the **public** key (`age1…`) is ever shared. It lets you encrypt *to* someone, never decrypt.
 
@@ -673,8 +676,9 @@ appears when the store actually is in a git work tree.
 | `eval "$(envstow env --off)"` | Unset everything envstow set in this shell (names only — needs no key). |
 | `eval "$(envstow refresh)"` | Unset *deleted* names an unlocked shell still holds (emits only `unset`, never a value — safe anywhere `env` isn't). |
 | `eval "$(envstow shell-init)"` | (In your shell rc, optional) install the wrapper so `set` inside an unlocked shell goes live instantly — see [First-time setup](#1-first-time-setup). |
-| `envstow add-recipient <age1…> [label]` | Add a collaborator **and** re-encrypt — both steps. |
-| `envstow remove-recipient <key\|label>` | Remove a collaborator; re-encrypt (then **rotate**). |
+| `envstow add-recipient <age1…> [label]` | Add a collaborator **and** re-encrypt every profile — both steps. |
+| `envstow remove-recipient <key\|label>` | Remove a collaborator; re-encrypt every profile (then **rotate**). Refuses, changing nothing, if any profile won't open with your key. |
+| `envstow list-recipients` | List collaborators (public keys + labels; yours marked), then check each profile was encrypted to that many keys — flags any that needs `reencrypt`. A count check: it can't spot one key swapped for another, except your own. |
 | `envstow reencrypt` | Re-encrypt to the current `recipients` — after someone's key was added by hand or by their `init`. |
 | `envstow profile [create <name>]` | Show the current profile, or create a new one. |
 | `envstow upgrade [--check\|--yes]` | Upgrade envstow to the latest release (`--check` just reports). |

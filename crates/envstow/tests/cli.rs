@@ -1496,6 +1496,219 @@ fn a_listed_but_not_yet_reencrypted_key_gets_a_different_hint() {
     );
 }
 
+/// Run `envstow <args>` against `repo`'s store but with `who`'s identity.
+fn run_as(repo: &Repo, who: &Repo, args: &[&str]) -> Output {
+    repo.run_env(args, "", "ENVSTOW_IDENTITY", who.identity.to_str().unwrap())
+}
+
+#[test]
+fn recipient_changes_reencrypt_every_profile() {
+    let owner = Repo::new("allprof");
+    assert_eq!(owner.run(&["init"], "").code, 0);
+    assert_eq!(owner.run(&["profile", "create", "prod"], "").code, 0);
+    assert_eq!(
+        owner
+            .run(&["--profile", "prod", "set", "PROD_KEY"], "v")
+            .code,
+        0
+    );
+    let collab = Repo::new("allprof-collab");
+    assert_eq!(collab.run(&["init"], "").code, 0);
+
+    // Added while `default` is the current profile — prod must open for them too.
+    let add = owner.run(&["add-recipient", &collab.public_key(), "alice"], "");
+    assert_eq!(add.code, 0, "{}", add.stderr);
+    assert!(
+        add.stderr.contains("re-encrypted default, prod"),
+        "{}",
+        add.stderr
+    );
+    let prod = run_as(&owner, &collab, &["--profile", "prod", "list"]);
+    assert_eq!(
+        prod.code, 0,
+        "collaborator should read prod: {}",
+        prod.stderr
+    );
+    assert!(prod.stdout.contains("PROD_KEY"));
+
+    // Removed — and locked out of prod too, not just the current profile.
+    let rm = owner.run(&["remove-recipient", "alice"], "");
+    assert_eq!(rm.code, 0, "{}", rm.stderr);
+    for profile in ["default", "prod"] {
+        let out = run_as(&owner, &collab, &["--profile", profile, "list"]);
+        assert_ne!(out.code, 0, "removed key must not open {profile}");
+    }
+}
+
+#[test]
+fn recipient_change_refuses_if_any_profile_is_unreadable() {
+    let owner = Repo::new("allprof-refuse");
+    assert_eq!(owner.run(&["init"], "").code, 0);
+    let collab = Repo::new("allprof-refuse-collab");
+    assert_eq!(collab.run(&["init"], "").code, 0);
+    assert_eq!(
+        owner
+            .run(&["add-recipient", &collab.public_key(), "alice"], "")
+            .code,
+        0
+    );
+    // A profile the owner can't open: the collaborator's own store, encrypted only to them.
+    std::fs::copy(collab.store(), owner.entry().join("other.enc")).unwrap();
+
+    let recipients_before = std::fs::read(owner.recipients()).unwrap();
+    let default_before = std::fs::read(owner.store()).unwrap();
+    let rm = owner.run(&["remove-recipient", "alice"], "");
+    assert_ne!(
+        rm.code, 0,
+        "must refuse a removal it can't apply to every profile"
+    );
+    assert!(
+        rm.stderr.contains("can't decrypt profile 'other'")
+            && rm.stderr.contains("Nothing was changed"),
+        "{}",
+        rm.stderr
+    );
+    assert_eq!(
+        std::fs::read(owner.recipients()).unwrap(),
+        recipients_before
+    );
+    assert_eq!(std::fs::read(owner.store()).unwrap(), default_before);
+}
+
+#[test]
+fn list_recipients_shows_keys_labels_and_you() {
+    let owner = Repo::new("lsrecip");
+    assert_eq!(owner.run(&["init"], "").code, 0);
+    assert_eq!(owner.run(&["profile", "create", "prod"], "").code, 0);
+    let collab = Repo::new("lsrecip-collab");
+    assert_eq!(collab.run(&["init"], "").code, 0);
+    let collab_pub = collab.public_key();
+    assert_eq!(
+        owner.run(&["add-recipient", &collab_pub, "alice"], "").code,
+        0
+    );
+
+    let out = owner.run(&["list-recipients"], "");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    // stdout is just the recipients, one per line: pipe-friendly.
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "stdout: {}", out.stdout);
+    assert!(lines
+        .iter()
+        .any(|l| l.starts_with(&owner.public_key()) && l.ends_with("(you)")));
+    assert!(lines.iter().any(|l| *l == format!("{collab_pub}  alice")));
+    // add-recipient re-encrypts every profile, not just the current one.
+    assert!(
+        out.stderr.contains("default: encrypted to 2 key(s) ✓"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("prod: encrypted to 2 key(s) ✓"),
+        "{}",
+        out.stderr
+    );
+
+    // The short alias is the same command.
+    let alias = owner.run(&["recipients"], "");
+    assert_eq!((alias.code, &alias.stdout), (0, &out.stdout));
+}
+
+#[test]
+fn list_recipients_flags_a_hand_added_key() {
+    let owner = Repo::new("lsrecip-drift");
+    assert_eq!(owner.run(&["init"], "").code, 0);
+    let collab = Repo::new("lsrecip-drift-collab");
+    assert_eq!(collab.run(&["init"], "").code, 0);
+    let collab_pub = collab.public_key();
+
+    // A key appended to `recipients` without re-encrypting grants nothing — and is flagged.
+    let mut text = std::fs::read_to_string(owner.recipients()).unwrap();
+    text.push_str(&format!("{collab_pub} bob\n"));
+    std::fs::write(owner.recipients(), text).unwrap();
+    let out = owner.run(&["list-recipients"], "");
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("default: encrypted to 1 key(s), but recipients lists 2")
+            && out.stderr.contains("`envstow reencrypt`"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn list_recipients_catches_a_swap_of_your_own_key() {
+    // Store encrypted to [owner, bob]; then bob's line is replaced by alice's by hand. The count
+    // still matches, so only alice — who can check her own key — sees the problem.
+    let owner = Repo::new("lsrecip-swap");
+    assert_eq!(owner.run(&["init"], "").code, 0);
+    let bob = Repo::new("lsrecip-swap-bob");
+    assert_eq!(bob.run(&["init"], "").code, 0);
+    let alice = Repo::new("lsrecip-swap-alice");
+    assert_eq!(alice.run(&["init"], "").code, 0);
+    assert_eq!(
+        owner
+            .run(&["add-recipient", &bob.public_key(), "bob"], "")
+            .code,
+        0
+    );
+    let text = std::fs::read_to_string(owner.recipients())
+        .unwrap()
+        .replace(&bob.public_key(), &alice.public_key());
+    std::fs::write(owner.recipients(), text).unwrap();
+
+    let as_owner = owner.run(&["list-recipients"], "");
+    assert!(
+        as_owner.stderr.contains("default: encrypted to 2 key(s) ✓"),
+        "{}",
+        as_owner.stderr
+    );
+
+    let as_alice = owner.run_env(
+        &["list-recipients"],
+        "",
+        "ENVSTOW_IDENTITY",
+        alice.identity.to_str().unwrap(),
+    );
+    assert_eq!(as_alice.code, 0, "{}", as_alice.stderr);
+    assert!(
+        as_alice.stdout.contains("bob  (you)"),
+        "{}",
+        as_alice.stdout
+    );
+    assert!(
+        as_alice.stderr.contains("not yours although you're listed"),
+        "{}",
+        as_alice.stderr
+    );
+}
+
+#[test]
+fn list_recipients_works_without_an_identity() {
+    let owner = Repo::new("lsrecip-noid");
+    assert_eq!(owner.run(&["init"], "").code, 0);
+    let missing = owner.dir.join("no-such-identity.txt");
+    let out = owner.run_env(
+        &["list-recipients"],
+        "",
+        "ENVSTOW_IDENTITY",
+        missing.to_str().unwrap(),
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        out.stdout.starts_with(&owner.public_key()),
+        "{}",
+        out.stdout
+    );
+    assert!(!out.stdout.contains("(you)"));
+    assert!(
+        out.stderr.contains("default: encrypted to 1 key(s) ✓"),
+        "{}",
+        out.stderr
+    );
+}
+
 #[test]
 fn add_and_remove_recipient_controls_access() {
     // Owner repo.

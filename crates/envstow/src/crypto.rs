@@ -117,6 +117,38 @@ pub fn decrypt(
     Ok(out)
 }
 
+/// Count the X25519 recipient stanzas in an age file's header — how many keys it was encrypted
+/// to. Returns `None` if the header doesn't parse.
+///
+/// This is a COUNT, not a list: an X25519 stanza carries an ephemeral share, not the recipient's
+/// public key, so the header cannot say WHO can decrypt. Only X25519 stanzas are counted, so any
+/// grease stanzas (random tags age may add) don't inflate it. Reads the header only; no key
+/// material is needed and nothing is decrypted.
+pub fn count_x25519_stanzas(ciphertext: &[u8]) -> Option<usize> {
+    let mut lines = ciphertext.split(|b| *b == b'\n');
+    if lines.next()? != b"age-encryption.org/v1" {
+        return None;
+    }
+    let mut count = 0;
+    for line in lines {
+        if line.starts_with(b"---") {
+            return Some(count);
+        }
+        if line.starts_with(b"-> X25519 ") {
+            count += 1;
+        }
+    }
+    None // no MAC line: truncated or not an age file
+}
+
+/// Whether `identity` can unwrap the file key of `ciphertext` — i.e. is one of its recipients.
+/// Stops at the header: the payload is never read, so no plaintext is produced.
+pub fn is_recipient_of(ciphertext: &[u8], identity: &age::x25519::Identity) -> bool {
+    age::Decryptor::new(ciphertext)
+        .and_then(|d| d.decrypt(iter::once(identity as &dyn age::Identity)))
+        .is_ok()
+}
+
 /// Parse an `AGE-SECRET-KEY-...` string into an identity for decryption.
 pub fn parse_identity(secret: &str) -> Result<age::x25519::Identity, CryptoError> {
     age::x25519::Identity::from_str(secret.trim()).map_err(|_| CryptoError::BadIdentity)
@@ -254,6 +286,33 @@ mod tests {
         let ct = encrypt(b"SECRET=1\n", &[parse_recipient(&pub_a).unwrap()]).unwrap();
         let err = decrypt(&ct, &parse_identity(&sec_b).unwrap());
         assert!(matches!(err, Err(CryptoError::Decrypt(_))));
+    }
+
+    #[test]
+    fn stanza_count_matches_recipient_count() {
+        let keys: Vec<_> = (0..3).map(|_| generate_keypair()).collect();
+        for n in 1..=3 {
+            let recips: Vec<_> = keys[..n]
+                .iter()
+                .map(|(p, _)| parse_recipient(p).unwrap())
+                .collect();
+            let ct = encrypt(b"X=1\n", &recips).unwrap();
+            assert_eq!(count_x25519_stanzas(&ct), Some(n));
+        }
+        assert_eq!(count_x25519_stanzas(b"not an age file"), None);
+        assert_eq!(
+            count_x25519_stanzas(b"age-encryption.org/v1\n-> X25519 abc\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn is_recipient_of_checks_membership() {
+        let (pub_a, sec_a) = generate_keypair();
+        let (_pub_b, sec_b) = generate_keypair();
+        let ct = encrypt(b"X=1\n", &[parse_recipient(&pub_a).unwrap()]).unwrap();
+        assert!(is_recipient_of(&ct, &parse_identity(&sec_a).unwrap()));
+        assert!(!is_recipient_of(&ct, &parse_identity(&sec_b).unwrap()));
     }
 
     #[test]

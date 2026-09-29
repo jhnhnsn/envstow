@@ -172,8 +172,15 @@ unlocked session. Prints **names only**. Exit = lock.
   recipient, create the first file. With `--store`/`--store-dir` the store is created outside the
   repo and **nothing** is written into it; reach it with the same flag or its env var.
 - `envstow add-recipient <age1...>` / `envstow remove-recipient <age1...|name>` —
-  re-encrypt to the new recipient set. Removal prints the rotation reminder (removing a key
-  only blocks future commits; rotate to truly revoke).
+  re-encrypt **every profile** to the new recipient set (profiles share one `recipients` file).
+  Every profile is decrypted before anything is written; if any won't open, nothing changes —
+  a removal that skipped a profile would leave the key able to read it. Removal prints the
+  rotation reminder (removing a key only blocks future commits; rotate to truly revoke).
+- `envstow list-recipients` — print the recipients (public keys only; safe under an agent), then
+  check each profile against them. The age header can't name its X25519 recipients (a stanza
+  holds an ephemeral share, not the key), only count them, so drift from the `recipients` file
+  is detected by count, plus whether *your* key can actually unwrap. A swap of someone else's key
+  keeps the count equal and goes unnoticed — the output says it's a count check.
 
 ## Guardrails (secondary, accident-only)
 

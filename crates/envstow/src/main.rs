@@ -19,6 +19,7 @@
 //!   envstow pubkey                  Print your age public key (share it to be added).
 //!   envstow add-recipient <age1..>  Add a recipient and re-encrypt the store.
 //!   envstow remove-recipient <k|nm> Remove a recipient and re-encrypt (then rotate!).
+//!   envstow list-recipients         List recipients; check each profile was encrypted to them.
 //!   envstow reencrypt               Re-encrypt the store to the current recipients file.
 //!   envstow --version               Print the version.
 //!   envstow -h | --help
@@ -52,7 +53,7 @@ use agent::{mask, masked_preview, under_agent};
 use cli::{parse_simple, resolve_target};
 use error::AppError;
 use layout::Recipient;
-use store::{encrypt_payload, load_secrets_in, reencrypt_store, write_secrets};
+use store::{change_recipients, encrypt_payload, load_secrets_in, reencrypt_store, write_secrets};
 
 /// A command's result: `Ok(())` on success, or an [`AppError`] carrying the message and exit code.
 type Cmd = Result<(), AppError>;
@@ -149,6 +150,7 @@ fn main() {
         Some("init") => cmd_init(&args[1..]),
         Some("add-recipient") => cmd_add_recipient(&args[1..]),
         Some("remove-recipient") => cmd_remove_recipient(&args[1..]),
+        Some("list-recipients") | Some("recipients") => cmd_list_recipients(&args[1..]),
         Some("reencrypt") => cmd_reencrypt(&args[1..]),
         Some("store") => cmd_store(&args[1..]),
         Some("profile") => cmd_profile(&args[1..]),
@@ -745,11 +747,13 @@ fn maybe_install_skill(repo_root: &Path) {
 // recipient management
 // ---------------------------------------------------------------------------
 
+/// `envstow add-recipient <age1...> [label]` — add a key and re-encrypt EVERY profile to it.
+/// `--profile` is accepted but irrelevant: all profiles share the one recipients file.
 fn cmd_add_recipient(args: &[String]) -> Cmd {
-    let (sel, profile, args) = resolve_target(args)?;
+    let (sel, _profile, args) = resolve_target(args)?;
     let Some(key) = args.first() else {
         return Err(AppError::usage(
-            "usage: envstow add-recipient <age1...> [label] [--profile P]",
+            "usage: envstow add-recipient <age1...> [label]",
         ));
     };
     if crypto::parse_recipient(key).is_err() {
@@ -759,7 +763,8 @@ fn cmd_add_recipient(args: &[String]) -> Cmd {
     }
     let label = args.get(1).cloned();
 
-    let paths = layout::locate_in(&sel, &profile)?;
+    let (root, _source) = layout::resolve_root(&sel)?;
+    let paths = layout::locate_in(&sel, layout::DEFAULT_PROFILE)?;
     let mut recipients = layout::read_recipients(&paths.recipients).unwrap_or_default();
     if recipients.iter().any(|r| &r.key == key) {
         // Already present is not an error — nothing to do.
@@ -771,24 +776,24 @@ fn cmd_add_recipient(args: &[String]) -> Cmd {
         label,
     });
 
-    if let Err(e) = std::fs::write(&paths.recipients, layout::render_recipients(&recipients)) {
-        return Err(AppError::msg(format!(
-            "could not update recipients file: {e}"
-        )));
-    }
+    change_recipients(&root, &paths.recipients, &recipients)?;
     eprintln!("added recipient to {}", paths.recipients.display());
-    reencrypt_store(&paths.store, &recipients)
+    Ok(())
 }
 
+/// `envstow remove-recipient <age1...|label>` — drop a key and re-encrypt EVERY profile without
+/// it. Refuses (changing nothing) if any profile can't be re-encrypted, since a partial removal
+/// would leave the key able to read that profile.
 fn cmd_remove_recipient(args: &[String]) -> Cmd {
-    let (sel, profile, args) = resolve_target(args)?;
+    let (sel, _profile, args) = resolve_target(args)?;
     let Some(target) = args.first() else {
         return Err(AppError::usage(
-            "usage: envstow remove-recipient <age1...|label> [--profile P]",
+            "usage: envstow remove-recipient <age1...|label>",
         ));
     };
 
-    let paths = layout::locate_in(&sel, &profile)?;
+    let (root, _source) = layout::resolve_root(&sel)?;
+    let paths = layout::locate_in(&sel, layout::DEFAULT_PROFILE)?;
     let recipients = layout::read_recipients(&paths.recipients).unwrap_or_default();
 
     let matches: Vec<&Recipient> = recipients
@@ -815,18 +820,113 @@ fn cmd_remove_recipient(args: &[String]) -> Cmd {
         ));
     }
 
-    if let Err(e) = std::fs::write(&paths.recipients, layout::render_recipients(&kept)) {
-        return Err(AppError::msg(format!(
-            "could not update recipients file: {e}"
-        )));
-    }
+    change_recipients(&root, &paths.recipients, &kept)?;
     eprintln!("removed recipient; {} remain.", kept.len());
-    reencrypt_store(&paths.store, &kept)?;
     eprintln!(
         "\n⚠️  Removing a recipient only blocks FUTURE decryptions. Their key still decrypts\n\
-         every historical commit in any clone they kept. Rotate every secret they saw at the\n\
-         source to truly revoke access."
+         every historical commit in any clone they kept. Rotate every secret they saw — in\n\
+         every profile — at the source to truly revoke access."
     );
+    Ok(())
+}
+
+/// `envstow list-recipients` — print the store's recipients (public keys + labels, never secret
+/// material; safe under an agent), then check each profile's ciphertext against that list.
+///
+/// The check is the point beyond `cat recipients`: that file is an INPUT to encryption, not an
+/// access list, and it drifts from what the `.enc` files were actually encrypted to (a key added
+/// by hand or by a teammate's `init`, never re-encrypted). The age header can't name its
+/// recipients, only count them, so drift is caught by count — plus, when we have an identity,
+/// whether YOUR key is really among them. A swap (one key out, another in, no re-encrypt) keeps
+/// the count equal and is only caught for your own key.
+fn cmd_list_recipients(args: &[String]) -> Cmd {
+    // `--profile` is accepted (and ignored) so the global flag doesn't break this: every profile
+    // shares the one recipients file, and all of them are checked.
+    let (sel, _profile, rest) = resolve_target(args)?;
+    if !rest.is_empty() {
+        return Err(AppError::usage("usage: envstow list-recipients"));
+    }
+    let (root, _source) = layout::resolve_root(&sel)?;
+    let paths = layout::locate_in(&sel, layout::DEFAULT_PROFILE)?;
+    let recipients = layout::read_recipients(&paths.recipients).map_err(|e| {
+        AppError::msg(format!(
+            "could not read {}: {e}",
+            paths.recipients.display()
+        ))
+    })?;
+
+    // Your identity is optional here: listing public keys needs no key, and someone who hasn't
+    // run `init` yet may reasonably want to see who's on the store.
+    let identity = layout::read_identity_secret().ok().and_then(|s| {
+        let public = crypto::public_from_secret(&s).ok()?;
+        let identity = crypto::parse_identity(&s).ok()?;
+        Some((public, identity))
+    });
+    let me = identity.as_ref().map(|(public, _)| public.as_str());
+
+    eprintln!("recipients ({}):", paths.recipients.display());
+    for r in &recipients {
+        let mut line = r.key.clone();
+        if let Some(label) = &r.label {
+            line.push_str(&format!("  {label}"));
+        }
+        if Some(r.key.as_str()) == me {
+            line.push_str("  (you)");
+        }
+        println!("{line}");
+    }
+    if recipients.is_empty() {
+        eprintln!("   (none)");
+    }
+    let listed_me = me.is_some_and(|me| recipients.iter().any(|r| r.key == me));
+
+    let profiles = layout::list_profiles(&root);
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    eprintln!();
+    let mut stale = false;
+    for profile in &profiles {
+        let store = root.join(format!("{profile}.enc"));
+        let reencrypt = if profile == layout::DEFAULT_PROFILE {
+            "envstow reencrypt".to_string()
+        } else {
+            format!("envstow --profile {profile} reencrypt")
+        };
+        let ct = match layout::StoreVersion::read(&store).and_then(|v| v.split_ciphertext(&store)) {
+            Ok(ct) => ct,
+            Err(e) => {
+                eprintln!("{profile}: unreadable — {e}");
+                continue;
+            }
+        };
+        let Some(count) = crypto::count_x25519_stanzas(&ct) else {
+            eprintln!("{profile}: not a valid age file");
+            continue;
+        };
+        let decryptable = identity
+            .as_ref()
+            .map(|(_, id)| crypto::is_recipient_of(&ct, id));
+        if count != recipients.len() {
+            stale = true;
+            eprintln!(
+                "{profile}: encrypted to {count} key(s), but recipients lists {} — \
+                 an existing recipient must run `{reencrypt}`",
+                recipients.len()
+            );
+        } else if listed_me && decryptable == Some(false) {
+            stale = true;
+            eprintln!(
+                "{profile}: encrypted to {count} key(s), but not yours although you're listed — \
+                 an existing recipient must run `{reencrypt}`"
+            );
+        } else {
+            eprintln!("{profile}: encrypted to {count} key(s) ✓");
+        }
+    }
+    if !stale {
+        eprintln!("   (a count check: it can't tell a swapped key from the one it replaced)");
+    }
     Ok(())
 }
 
@@ -993,8 +1093,9 @@ fn print_help() {
          \x20 envstow shell-init               Print the optional shell hook for your rc: eval \"$(envstow shell-init)\".\n\
          \x20 envstow init [--no-skill]        Create identity + recipients + store; add agent skill.\n\
          \x20 envstow store                    Show which store is in effect (and why); list stores.\n\
-         \x20 envstow add-recipient <age1..>   Add a collaborator and re-encrypt.\n\
-         \x20 envstow remove-recipient <k|nm>  Remove a collaborator and re-encrypt (then rotate).\n\
+         \x20 envstow add-recipient <age1..>   Add a collaborator; re-encrypt every profile.\n\
+         \x20 envstow remove-recipient <k|nm>  Remove a collaborator; re-encrypt every profile (then rotate).\n\
+         \x20 envstow list-recipients          List collaborators; flag profiles not re-encrypted to them.\n\
          \x20 envstow reencrypt                Re-encrypt the store to the current recipients.\n\
          \x20 envstow profile [create <name>]  Show the current profile, or create a new one.\n\
          \x20 envstow profiles                 List available profiles.\n\

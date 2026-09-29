@@ -2,6 +2,28 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
+## 0.2.4
+
+### Added
+- **`envstow list-recipients`** (alias `recipients`) — lists the store's collaborators (public
+  keys and labels, your own marked `(you)`) on stdout, then checks every profile's ciphertext
+  against that list on stderr. `recipients` is an input to encryption, not an access list, so it
+  drifts: a key added by hand or by a teammate's `init` grants nothing until someone re-encrypts.
+  The command names each profile that's out of date and the `reencrypt` that fixes it. The age
+  header can only *count* its recipients, not name them, so this is a count check — plus whether
+  your own key really unwraps; it can't spot someone else's key swapped for another. Needs no
+  identity to list, and never decrypts a payload.
+
+### Fixed
+- **`add-recipient` and `remove-recipient` now re-encrypt every profile**, not just the current
+  one. All profiles share one `recipients` file, but only the current profile's store was
+  re-encrypted — so an added collaborator couldn't open `prod`, and worse, a **removed** one could
+  still read every profile other than the one you happened to be on. Every profile is now
+  decrypted before anything is written; if any won't open with your key, the command changes
+  nothing and says which. If you removed a recipient on an earlier version with more than one
+  profile, run `envstow list-recipients` — it flags any profile that still includes them — and
+  `envstow --profile <name> reencrypt` each one it names (then rotate, as always).
+
 ## 0.2.3
 
 ### Added
