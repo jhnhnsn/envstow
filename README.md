@@ -1,5 +1,7 @@
 # envstow
 
+*Pronounced "en-vee-stow".*
+
 An **age-encrypted key-value store that lives in a folder**, surfaced **by name** — so neither a
 human nor an AI coding agent (Claude Code, Cursor, …) has to paste a secret's plaintext onto a
 command line.
