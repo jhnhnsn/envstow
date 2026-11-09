@@ -21,3 +21,8 @@ install-updater = false
 # envstow, but the CURRENT shell won't until it's reloaded — call that out so nobody thinks
 # the install failed when `envstow` isn't found in the same terminal.
 install-success-msg = "envstow installed. Open a NEW terminal (or run: source ~/.local/bin/env), then check it with: envstow --version"
+
+# GitHub retired the macos-14 runner image, which dist 0.32 still picks for Apple Silicon builds
+# ("The configuration 'macos-14-arm64-us-default' is not supported"). Pin a supported one.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
