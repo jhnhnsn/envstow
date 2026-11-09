@@ -474,13 +474,59 @@ fn cmd_delete(args: &[String]) -> Cmd {
 }
 
 /// `envstow list` — print the variable NAMES in the store (never values).
+///
+/// On a terminal the names get a `NAME` header (dim and underlined, unless `$NO_COLOR` is set).
+/// Piped, the output stays one bare name per line, so `envstow list | xargs …` keeps working.
 fn cmd_list(args: &[String]) -> Cmd {
     let (sel, profile, _args) = resolve_target(args)?;
     let secrets = load_secrets_in(&sel, &profile)?;
-    for name in secrets.names() {
-        println!("{name}");
-    }
+    let names: Vec<&str> = secrets.names().collect();
+    let style = if !io::stdout().is_terminal() {
+        ListStyle::Plain
+    } else if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        ListStyle::Table { color: false }
+    } else {
+        ListStyle::Table { color: true }
+    };
+    print!("{}", render_list(&names, style));
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ListStyle {
+    /// One bare name per line — the scriptable form.
+    Plain,
+    /// A `NAME` header over the names; `color` adds ANSI dim + underline to the header.
+    Table { color: bool },
+}
+
+/// Render `envstow list` output. An empty store renders as nothing in either style — a header
+/// over no rows reads as a glitch.
+fn render_list(names: &[&str], style: ListStyle) -> String {
+    let mut out = String::new();
+    if let ListStyle::Table { color } = style {
+        if names.is_empty() {
+            return out;
+        }
+        const HEADER: &str = "NAME";
+        let width = names
+            .iter()
+            .map(|n| n.chars().count())
+            .chain([HEADER.len()])
+            .max()
+            .unwrap_or(0);
+        if color {
+            // Underline the padded header so the rule spans the column, as `gh` tables do.
+            out.push_str(&format!("\x1b[2;4m{HEADER:<width$}\x1b[0m\n"));
+        } else {
+            out.push_str(&format!("{HEADER}\n"));
+        }
+    }
+    for name in names {
+        out.push_str(name);
+        out.push('\n');
+    }
+    out
 }
 
 /// `envstow pubkey` — print YOUR age public key (derived from your identity), so you can share
@@ -1125,4 +1171,38 @@ fn print_help() {
          output is safe or you pass --show."
     );
     let _ = io::stdout().flush();
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::{render_list, ListStyle};
+
+    #[test]
+    fn plain_is_bare_names() {
+        assert_eq!(render_list(&["A", "BB"], ListStyle::Plain), "A\nBB\n");
+    }
+
+    #[test]
+    fn table_underlines_header_to_column_width() {
+        let out = render_list(&["A", "LONG_NAME"], ListStyle::Table { color: true });
+        assert_eq!(out, "\x1b[2;4mNAME     \x1b[0m\nA\nLONG_NAME\n");
+    }
+
+    #[test]
+    fn table_header_never_narrower_than_its_label() {
+        let out = render_list(&["A"], ListStyle::Table { color: true });
+        assert_eq!(out, "\x1b[2;4mNAME\x1b[0m\nA\n");
+    }
+
+    #[test]
+    fn no_color_table_is_plain_header() {
+        let out = render_list(&["A"], ListStyle::Table { color: false });
+        assert_eq!(out, "NAME\nA\n");
+    }
+
+    #[test]
+    fn empty_store_renders_nothing() {
+        assert_eq!(render_list(&[], ListStyle::Table { color: true }), "");
+        assert_eq!(render_list(&[], ListStyle::Plain), "");
+    }
 }

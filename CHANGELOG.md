@@ -2,6 +2,13 @@
 
 All notable changes to envstow are documented here. Versions follow [SemVer](https://semver.org).
 
+## 0.2.5
+
+### Changed
+- **`envstow list` on a terminal prints a `NAME` header**, dim and underlined across the column
+  (plain when `$NO_COLOR` is set). Piped output is unchanged — one bare name per line — so
+  scripts keep working. An empty store still prints nothing.
+
 ## 0.2.4
 
 ### Added
